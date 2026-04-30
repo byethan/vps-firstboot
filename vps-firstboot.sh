@@ -245,10 +245,37 @@ This will disable SSH password login. Root login remains key-only if the user is
 PLAN
 }
 
+show_verification_status() {
+  printf '\nVerification:\n'
+  printf '%s\n' '--- ssh listen ---'
+  ss -ltnp | grep -E ":(22|$SSH_PORT)\\b" || true
+
+  printf '%s\n' '--- sshd config ---'
+  sshd -T | grep -E '^(port|passwordauthentication|permitrootlogin|allowusers|pubkeyauthentication)' || true
+
+  if [[ "$ENABLE_FAIL2BAN" == "yes" ]]; then
+    printf '%s\n' '--- fail2ban service ---'
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl is-active fail2ban || true
+    else
+      service fail2ban status || true
+    fi
+
+    printf '%s\n' '--- fail2ban sshd jail ---'
+    if command -v fail2ban-client >/dev/null 2>&1; then
+      fail2ban-client status sshd || true
+    else
+      printf '%s\n' 'fail2ban-client not found'
+    fi
+  fi
+}
+
 final_message() {
   cat <<DONE
 
 Done.
+
+The current SSH and fail2ban status is shown above.
 
 Do not close this terminal yet. Open a second terminal and test:
   ssh -p $SSH_PORT $SSH_USER@SERVER_IP
@@ -265,6 +292,7 @@ main() {
   install_authorized_keys
   configure_sshd
   install_fail2ban
+  show_verification_status
   final_message
 }
 
