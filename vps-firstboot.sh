@@ -8,6 +8,7 @@ SSH_PORT="${SSH_PORT:-}"
 PUBLIC_KEY="${PUBLIC_KEY:-}"
 PUBLIC_KEY_FILE="${PUBLIC_KEY_FILE:-}"
 COPY_ROOT_KEYS="${COPY_ROOT_KEYS:-yes}"
+ENABLE_FAIL2BAN="${ENABLE_FAIL2BAN:-yes}"
 ASSUME_YES="${ASSUME_YES:-no}"
 
 usage() {
@@ -21,17 +22,19 @@ Options:
   --public-key KEY      SSH public key text to install for the user
   --key-file PATH       File containing one SSH public key on the server
   --no-copy-root-keys   Do not copy /root/.ssh/authorized_keys as fallback
+  --no-fail2ban         Do not install and configure fail2ban
   -y, --yes             Non-interactive mode
   -h, --help            Show this help
 
 Environment variables with the same names also work:
-  SSH_USER, SSH_PORT, PUBLIC_KEY, PUBLIC_KEY_FILE, COPY_ROOT_KEYS, ASSUME_YES
+  SSH_USER, SSH_PORT, PUBLIC_KEY, PUBLIC_KEY_FILE, COPY_ROOT_KEYS, ENABLE_FAIL2BAN, ASSUME_YES
 
 What this script does:
   1. install SSH public keys for an existing SSH user, root by default
   2. move SSH to the port you specify
   3. disable SSH password login
   4. keep root login key-only
+  5. install fail2ban and protect the SSH port
 
 Important:
   Keep the current SSH session open. Open a second terminal and test:
@@ -83,6 +86,10 @@ parse_args() {
         ;;
       --no-copy-root-keys)
         COPY_ROOT_KEYS="no"
+        shift
+        ;;
+      --no-fail2ban)
+        ENABLE_FAIL2BAN="no"
         shift
         ;;
       -y|--yes)
@@ -180,6 +187,50 @@ SSHD
   fi
 }
 
+install_fail2ban() {
+  local fail2ban_backend="auto"
+
+  if [[ "$ENABLE_FAIL2BAN" != "yes" ]]; then
+    return 0
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y fail2ban
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y fail2ban
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y fail2ban
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache fail2ban
+  else
+    die "cannot install fail2ban automatically on this system; unsupported package manager"
+  fi
+
+  if command -v systemctl >/dev/null 2>&1 && command -v journalctl >/dev/null 2>&1; then
+    fail2ban_backend="systemd"
+  fi
+
+  install -d -m 0755 /etc/fail2ban/jail.d
+  cat > /etc/fail2ban/jail.d/sshd.local <<FAIL2BAN
+[sshd]
+enabled = true
+port = $SSH_PORT
+maxretry = 5
+findtime = 10m
+bantime = 1h
+backend = $fail2ban_backend
+FAIL2BAN
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable --now fail2ban
+    systemctl restart fail2ban
+  else
+    service fail2ban restart
+  fi
+}
+
 print_plan() {
   cat <<PLAN
 
@@ -187,6 +238,7 @@ Plan:
   ssh user:         $SSH_USER
   ssh port:        $SSH_PORT
   copy root keys:  $COPY_ROOT_KEYS
+  fail2ban:        $ENABLE_FAIL2BAN
 
 This will disable SSH password login. Root login remains key-only if the user is root.
 
@@ -212,6 +264,7 @@ main() {
 
   install_authorized_keys
   configure_sshd
+  install_fail2ban
   final_message
 }
 
