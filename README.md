@@ -6,6 +6,7 @@
 - 关闭 SSH 密码登录
 - root 只允许密钥登录
 - SSH 端口改到你指定的值
+- 安装并配置 `fail2ban` 保护 SSH 端口
 - 处理 `ssh.socket` 仍监听 22 的问题
 
 脚本不会创建用户，也不会配置 sudo。
@@ -32,6 +33,16 @@ sudo bash vps-firstboot.sh \
 sudo bash vps-firstboot.sh \
   --user <user> \
   --port <ssh-port> \
+  --public-key 'ssh-ed25519 AAAA... your-key-comment'
+```
+
+如果不想安装 `fail2ban`：
+
+```bash
+sudo bash vps-firstboot.sh \
+  --user <user> \
+  --port <ssh-port> \
+  --no-fail2ban \
   --public-key 'ssh-ed25519 AAAA... your-key-comment'
 ```
 
@@ -69,3 +80,23 @@ PermitRootLogin prohibit-password
 PermitEmptyPasswords no
 AllowUsers root
 ```
+
+Fail2ban 配置会写到：
+
+```text
+/etc/fail2ban/jail.d/sshd.local
+```
+
+内容大概是：
+
+```text
+[sshd]
+enabled = true
+port = <your-port>
+maxretry = 5
+findtime = 10m
+bantime = 1h
+backend = systemd
+```
+
+`backend` 会按系统自动选择，带 `systemd` 的机器通常会写成 `systemd`，其他环境会回落到 `auto`。
