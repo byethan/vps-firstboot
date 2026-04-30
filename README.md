@@ -52,6 +52,13 @@ sudo bash vps-firstboot.sh \
 ssh -p <ssh-port> root@SERVER_IP
 ```
 
+脚本运行结束时会顺手显示：
+
+- SSH 实际监听状态
+- `sshd -T` 关键配置
+- `fail2ban` 服务状态
+- `fail2ban` 的 `sshd` jail 状态
+
 确认能登录后，再关闭 root 会话。
 
 ## 没传 public key 时
