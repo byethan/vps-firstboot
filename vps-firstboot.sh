@@ -246,26 +246,31 @@ PLAN
 }
 
 show_verification_status() {
-  printf '\nVerification:\n'
-  printf '%s\n' '--- ssh listen ---'
-  ss -ltnp | grep -E ":(22|$SSH_PORT)\\b" || true
+  local sshd_t
+  sshd_t="$(sshd -T 2>/dev/null || true)"
 
-  printf '%s\n' '--- sshd config ---'
-  sshd -T | grep -E '^(port|passwordauthentication|permitrootlogin|allowusers|pubkeyauthentication)' || true
+  printf '\nVerification:\n'
+  printf 'ssh_listen_target: %s\n' "$(ss -ltnp | grep -Eq "[:.]${SSH_PORT}\\b" && echo yes || echo no)"
+  printf 'ssh_listen_22: %s\n' "$(ss -ltnp | grep -Eq '[:.]22\\b' && echo yes || echo no)"
+  printf 'sshd_port: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^port / {print $2; exit}')"
+  printf 'pubkeyauthentication: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^pubkeyauthentication / {print $2; exit}')"
+  printf 'passwordauthentication: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^passwordauthentication / {print $2; exit}')"
+  printf 'permitrootlogin: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^permitrootlogin / {print $2; exit}')"
+  printf 'allowusers: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^allowusers / {$1=""; sub(/^ /, ""); print; exit}')"
 
   if [[ "$ENABLE_FAIL2BAN" == "yes" ]]; then
-    printf '%s\n' '--- fail2ban service ---'
     if command -v systemctl >/dev/null 2>&1; then
-      systemctl is-active fail2ban || true
+      printf 'fail2ban_service: %s\n' "$(systemctl is-active fail2ban 2>/dev/null || echo not-installed)"
     else
-      service fail2ban status || true
+      printf 'fail2ban_service: %s\n' "unknown"
     fi
 
-    printf '%s\n' '--- fail2ban sshd jail ---'
     if command -v fail2ban-client >/dev/null 2>&1; then
-      fail2ban-client status sshd || true
+      printf 'fail2ban_jail_sshd: %s\n' "$(fail2ban-client status sshd 2>/dev/null | awk -F': *' '/Status for the jail/ {print $2; found=1} END{if(!found) print "missing"}')"
+      printf 'fail2ban_banned: %s\n' "$(fail2ban-client status sshd 2>/dev/null | awk -F': *' '/Currently banned/ {print $2; found=1} END{if(!found) print "unknown"}')"
     else
-      printf '%s\n' 'fail2ban-client not found'
+      printf 'fail2ban_jail_sshd: %s\n' "not-installed"
+      printf 'fail2ban_banned: %s\n' "unknown"
     fi
   fi
 }
