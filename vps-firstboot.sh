@@ -8,7 +8,7 @@ SSH_PORT="${SSH_PORT:-}"
 PUBLIC_KEY="${PUBLIC_KEY:-}"
 PUBLIC_KEY_FILE="${PUBLIC_KEY_FILE:-}"
 COPY_ROOT_KEYS="${COPY_ROOT_KEYS:-yes}"
-ENABLE_FAIL2BAN="${ENABLE_FAIL2BAN:-yes}"
+ENABLE_FAIL2BAN="${ENABLE_FAIL2BAN:-no}"
 ASSUME_YES="${ASSUME_YES:-no}"
 
 usage() {
@@ -22,6 +22,7 @@ Options:
   --public-key KEY      SSH public key text to install for the user
   --key-file PATH       File containing one SSH public key on the server
   --no-copy-root-keys   Do not copy /root/.ssh/authorized_keys as fallback
+  --enable-fail2ban     Install and configure fail2ban for the SSH port
   --no-fail2ban         Do not install and configure fail2ban
   -y, --yes             Non-interactive mode
   -h, --help            Show this help
@@ -34,7 +35,7 @@ What this script does:
   2. move SSH to the port you specify
   3. disable SSH password login
   4. keep root login key-only
-  5. install fail2ban and protect the SSH port
+  5. optionally install fail2ban and protect the SSH port
 
 Important:
   Keep the current SSH session open. Open a second terminal and test:
@@ -86,6 +87,10 @@ parse_args() {
         ;;
       --no-copy-root-keys)
         COPY_ROOT_KEYS="no"
+        shift
+        ;;
+      --enable-fail2ban)
+        ENABLE_FAIL2BAN="yes"
         shift
         ;;
       --no-fail2ban)
@@ -280,7 +285,7 @@ final_message() {
 
 Done.
 
-The current SSH and fail2ban status is shown above.
+The current verification status is shown above.
 
 Do not close this terminal yet. Open a second terminal and test:
   ssh -p $SSH_PORT $SSH_USER@SERVER_IP
