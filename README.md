@@ -3,8 +3,8 @@
 标准流程：
 
 1. 先补基础工具，确保能下载脚本、能跑后续检查
-2. 再执行一键脚本做 SSH 加固和 `fail2ban`
-3. 按验收清单确认 SSH 和 `fail2ban` 状态
+2. 再执行一键脚本做 SSH 加固
+3. 按验收清单确认 SSH 状态
 4. 最后再跑 `nq`
 
 脚本本身只做这几件事：
@@ -13,7 +13,7 @@
 - 关闭 SSH 密码登录
 - root 只允许密钥登录
 - SSH 端口改到你指定的值
-- 安装并配置 `fail2ban` 保护 SSH 端口
+- 可选安装并配置 `fail2ban` 保护 SSH 端口
 - 处理 `ssh.socket` 仍监听 22 的问题
 
 脚本不会创建用户，也不会配置 sudo。
@@ -98,13 +98,13 @@ sudo bash vps-firstboot.sh \
   --public-key 'ssh-ed25519 AAAA... your-key-comment'
 ```
 
-如果不想安装 `fail2ban`：
+如果想安装 `fail2ban`：
 
 ```bash
 sudo bash vps-firstboot.sh \
   --user <user> \
   --port <ssh-port> \
-  --no-fail2ban \
+  --enable-fail2ban \
   --public-key 'ssh-ed25519 AAAA... your-key-comment'
 ```
 
@@ -123,9 +123,7 @@ ssh -p <ssh-port> root@SERVER_IP
 - `passwordauthentication`
 - `permitrootlogin`
 - `allowusers`
-- `fail2ban_service`
-- `fail2ban_jail_sshd`
-- `fail2ban_banned`
+- 如果启用了 `fail2ban`，还会显示 `fail2ban_service`、`fail2ban_jail_sshd`、`fail2ban_banned`
 
 确认能登录后，再关闭 root 会话。
 
@@ -138,14 +136,17 @@ ssh -p <ssh-port> root@SERVER_IP
 - [ ] `passwordauthentication no`
 - [ ] `permitrootlogin without-password`
 - [ ] `allowusers root`
-- [ ] `fail2ban` 服务是运行中
-- [ ] `fail2ban` 的 `sshd` jail 已启用
 
 如果脚本输出不够，手动补查：
 
 ```bash
 ss -ltnp | grep -E ':(22|<ssh-port>)\b'
 sshd -T | grep -E '^(port|passwordauthentication|permitrootlogin|allowusers|pubkeyauthentication)'
+```
+
+如果启用了 `fail2ban`，再补查：
+
+```bash
 systemctl status fail2ban --no-pager
 fail2ban-client status
 fail2ban-client status sshd
@@ -202,7 +203,7 @@ PermitEmptyPasswords no
 AllowUsers root
 ```
 
-Fail2ban 配置会写到：
+如果启用了 `fail2ban`，配置会写到：
 
 ```text
 /etc/fail2ban/jail.d/sshd.local
