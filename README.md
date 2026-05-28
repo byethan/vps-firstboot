@@ -13,6 +13,11 @@
 - 关闭 SSH 密码登录
 - root 只允许密钥登录
 - SSH 端口改到你指定的值
+- 默认开启 Linux TCP `BBR + fq`
+- 默认按地区和带宽应用 VPS TCP/sysctl 优化
+- 可选配置 `tc` 出口整形，适合已测出链路上限的机器
+- 写入 `/etc/sysctl.d/99-vps-tcp-tune.conf`
+- 创建 `vps-fq-restore.service`，重启后自动恢复默认路由网卡的 `fq` 队列
 - 可选安装并配置 `fail2ban` 保护 SSH 端口
 - 处理 `ssh.socket` 仍监听 22 的问题
 
@@ -26,6 +31,7 @@
 - `wget`
 - `tar`
 - `bash`
+- 如果要用 `tc` 整形，还需要 `iproute2`
 
 这类基础工具没装好时，直接跑脚本或跑 `nq` 很容易报错。
 
@@ -33,25 +39,25 @@
 
 ```bash
 apt update
-apt install -y curl wget tar xz-utils gzip coreutils util-linux bash
+apt install -y curl wget tar xz-utils gzip coreutils util-linux bash iproute2
 ```
 
 ### Rocky / Alma / CentOS / Oracle Linux
 
 ```bash
-dnf install -y curl wget tar xz gzip coreutils util-linux bash
+dnf install -y curl wget tar xz gzip coreutils util-linux bash iproute
 ```
 
 如果没有 `dnf`：
 
 ```bash
-yum install -y curl wget tar xz gzip coreutils util-linux bash
+yum install -y curl wget tar xz gzip coreutils util-linux bash iproute
 ```
 
 ### Alpine
 
 ```bash
-apk add curl wget tar xz gzip coreutils util-linux bash
+apk add curl wget tar xz gzip coreutils util-linux bash iproute2
 ```
 
 ### 其他冷门系统
@@ -78,6 +84,8 @@ cat ~/.ssh/id_ed25519.pub
 ```bash
 sudo bash vps-firstboot.sh \
   --port <ssh-port> \
+  --bandwidth 500 \
+  --region asia \
   --public-key 'ssh-ed25519 AAAA... your-key-comment'
 ```
 
@@ -86,6 +94,8 @@ sudo bash vps-firstboot.sh \
 ```bash
 bash /root/vps-firstboot.sh \
   --port <ssh-port> \
+  --bandwidth 500 \
+  --region asia \
   --public-key 'ssh-ed25519 AAAA... your-key-comment'
 ```
 
@@ -95,6 +105,8 @@ bash /root/vps-firstboot.sh \
 sudo bash vps-firstboot.sh \
   --user <user> \
   --port <ssh-port> \
+  --bandwidth 1000 \
+  --region overseas \
   --public-key 'ssh-ed25519 AAAA... your-key-comment'
 ```
 
@@ -104,9 +116,80 @@ sudo bash vps-firstboot.sh \
 sudo bash vps-firstboot.sh \
   --user <user> \
   --port <ssh-port> \
+  --bandwidth 1000 \
+  --region asia \
   --enable-fail2ban \
   --public-key 'ssh-ed25519 AAAA... your-key-comment'
 ```
+
+网络优化可以单独跑，也可以和 SSH 加固一起跑。线路建议：
+
+```bash
+# 亚洲线路：港 / 日 / 韩 / 新加坡
+sudo bash vps-firstboot.sh --bandwidth 500 --region asia
+sudo bash vps-firstboot.sh --bandwidth 1000 --region asia
+
+# 美国 / 欧洲线路
+sudo bash vps-firstboot.sh --bandwidth 1000 --region overseas
+
+# 只预览配置，不应用
+bash vps-firstboot.sh --bandwidth 1000 --region asia --dry-run
+```
+
+脚本默认会开启系统级 Linux TCP `BBR + fq`，并写入一组按 `--region` 和 `--bandwidth` 选择的 TCP 参数。如果某台机器不想动网络队列和 TCP 拥塞控制，可以加：
+
+```bash
+sudo bash vps-firstboot.sh \
+  --user <user> \
+  --port <ssh-port> \
+  --bandwidth 500 \
+  --region asia \
+  --no-bbr-fq \
+  --public-key 'ssh-ed25519 AAAA... your-key-comment'
+```
+
+说明：系统级 `net.ipv4.tcp_congestion_control=bbr` 主要作用在 TCP。QUIC 是 UDP，QUIC 代理自身是否使用 BBR 取决于程序内部实现；但 `net.core.default_qdisc=fq` 仍然适合作为 VPS 的通用队列/pacing 基线。
+
+TCP/sysctl 优化包含：
+
+- `net.core.rmem_max` / `net.core.wmem_max`
+- `net.ipv4.tcp_rmem` / `net.ipv4.tcp_wmem`
+- `net.ipv4.tcp_mtu_probing = 1`
+- `net.ipv4.tcp_fastopen = 3`
+- `net.ipv4.tcp_slow_start_after_idle = 0`
+- `net.ipv4.tcp_syncookies = 1`
+- `net.ipv4.tcp_tw_reuse = 1`
+- `net.ipv4.tcp_keepalive_time = 600`
+- `net.ipv4.tcp_keepalive_intvl = 60`
+- `net.ipv4.tcp_keepalive_probes = 5`
+- `net.ipv4.tcp_max_syn_backlog`
+- `net.core.somaxconn`
+- `net.core.netdev_max_backlog`
+- `net.ipv4.ip_local_port_range = 10240 65535`
+
+这些参数不包含关闭 IPv6 这类强环境假设。如果不想改 TCP/sysctl 参数，只保留 SSH 加固，可以加：
+
+```bash
+sudo bash vps-firstboot.sh \
+  --user <user> \
+  --port <ssh-port> \
+  --no-vps-sysctl \
+  --public-key 'ssh-ed25519 AAAA... your-key-comment'
+```
+
+如果你已经测过链路，想把出口速率主动压在上限以下，可以显式启用 `tc` 整形。比如 100M 口压到 97M，且链路 MTU 需要 1492：
+
+```bash
+sudo bash vps-firstboot.sh \
+  --user <user> \
+  --port <ssh-port> \
+  --tc-iface ens17 \
+  --tc-rate 97mbit \
+  --tc-mtu 1492 \
+  --public-key 'ssh-ed25519 AAAA... your-key-comment'
+```
+
+`tc` 整形会立即生效；带 `systemd` 的系统会额外写入 `vps-tc-shape.service`，重启后自动恢复。不要照抄 `ens17`、`1492`、`97mbit`，这些必须按实际网卡名、MTU 和带宽测试结果改。
 
 脚本结束后不要关闭当前 SSH 会话。另开一个终端测试：
 
@@ -123,6 +206,22 @@ ssh -p <ssh-port> root@SERVER_IP
 - `passwordauthentication`
 - `permitrootlogin`
 - `allowusers`
+- `bbr_available`
+- `default_qdisc`
+- `tcp_congestion_control`
+- `tcp_rmem`
+- `tcp_wmem`
+- `tcp_mtu_probing`
+- `tcp_fastopen`
+- `tcp_slow_start_after_idle`
+- `tcp_tw_reuse`
+- `tcp_keepalive`
+- `tcp_max_syn_backlog`
+- `ip_local_port_range`
+- `somaxconn`
+- `fq_restore_service`
+- 默认路由网卡的 `tc_qdisc_<iface>`
+- 如果启用了 `tc` 整形，还会显示 `tc_shape`、`tc_qdisc_root`
 - 如果启用了 `fail2ban`，还会显示 `fail2ban_service`、`fail2ban_jail_sshd`、`fail2ban_banned`
 
 确认能登录后，再关闭 root 会话。
@@ -134,14 +233,27 @@ ssh -p <ssh-port> root@SERVER_IP
 - [ ] 本地能用新端口重新登录
 - [ ] SSH 实际监听的是目标端口
 - [ ] `passwordauthentication no`
-- [ ] `permitrootlogin without-password`
+- [ ] `permitrootlogin prohibit-password`
 - [ ] `allowusers root`
+- [ ] `default_qdisc fq`
+- [ ] `tcp_congestion_control bbr`
+- [ ] `tcp_mtu_probing 1`
+- [ ] `tcp_fastopen 3`
+- [ ] `tcp_slow_start_after_idle 0`
+- [ ] `fq_restore_service enabled`
 
 如果脚本输出不够，手动补查：
 
 ```bash
 ss -ltnp | grep -E ':(22|<ssh-port>)\b'
 sshd -T | grep -E '^(port|passwordauthentication|permitrootlogin|allowusers|pubkeyauthentication)'
+sysctl net.ipv4.tcp_available_congestion_control
+sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc
+sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem
+sysctl net.ipv4.tcp_mtu_probing net.ipv4.tcp_fastopen net.ipv4.tcp_keepalive_time net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_keepalive_probes
+systemctl is-enabled vps-fq-restore.service
+tc qdisc show
+tc qdisc show dev <iface>
 ```
 
 如果启用了 `fail2ban`，再补查：
@@ -182,12 +294,16 @@ bash <(curl -sL https://run.NodeQuality.com)
 
 如果 root 下面也没有可用 key，脚本会直接中止，不会继续关闭密码登录。
 
+如果传了 `--public-key` 或 `--key-file`，脚本会把新 key 追加到目标用户的 `authorized_keys`，不会清空原有 key。重复运行同一把 key 时不会重复追加。
+
+如果目标用户就是 `root`，且没有额外传 key，脚本会直接复用现有 `/root/.ssh/authorized_keys`，不会再把同一个文件复制给自己。
+
 ## 脚本改动的配置
 
 SSH 配置会写到：
 
 ```text
-/etc/ssh/sshd_config.d/99-login-hardening.conf
+/etc/ssh/sshd_config.d/00-login-hardening.conf
 ```
 
 内容大概是：
@@ -202,6 +318,8 @@ PermitRootLogin prohibit-password
 PermitEmptyPasswords no
 AllowUsers root
 ```
+
+脚本会先备份 `/etc/ssh/sshd_config` 到同目录的时间戳文件。为了保证 drop-in 配置真实生效，它会注释主配置里全局范围内和登录加固冲突的 SSH 指令，例如 `Port`、`PasswordAuthentication`、`PermitRootLogin`、`AllowUsers` 等；`Match` 块内的内容不会被批量改写。旧版脚本生成的 `/etc/ssh/sshd_config.d/99-login-hardening.conf` 会被清理，避免同一组托管配置重复出现。
 
 如果启用了 `fail2ban`，配置会写到：
 
@@ -222,3 +340,56 @@ backend = systemd
 ```
 
 `backend` 会按系统自动选择，带 `systemd` 的机器通常会写成 `systemd`，其他环境会回落到 `auto`。
+
+TCP 优化配置会写到：
+
+```text
+/etc/sysctl.d/99-vps-tcp-tune.conf
+```
+
+亚洲 1000M profile 的内容大概是：
+
+```text
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 134217728
+net.core.wmem_max = 134217728
+net.ipv4.tcp_rmem = 4096 87380 134217728
+net.ipv4.tcp_wmem = 4096 65536 134217728
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_keepalive_time = 600
+net.ipv4.tcp_keepalive_intvl = 60
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_max_syn_backlog = 16384
+net.core.somaxconn = 16384
+net.core.netdev_max_backlog = 32768
+net.ipv4.ip_local_port_range = 10240 65535
+```
+
+旧版脚本生成的这两个文件会被清理，避免 sysctl 顺序互相覆盖：
+
+```text
+/etc/sysctl.d/98-vps-baseline.conf
+/etc/sysctl.d/99-bbr-fq.conf
+```
+
+`fq` 自动恢复会写入：
+
+```text
+/etc/default/vps-fq-restore
+/usr/local/sbin/vps-fq-restore
+/etc/systemd/system/vps-fq-restore.service
+```
+
+如果启用了 `tc` 整形，会写入：
+
+```text
+/etc/default/vps-tc-shape
+/usr/local/sbin/vps-tc-shape
+/etc/systemd/system/vps-tc-shape.service
+```
