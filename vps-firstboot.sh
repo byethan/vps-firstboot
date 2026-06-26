@@ -19,8 +19,12 @@ BPFTUNE_REF="${BPFTUNE_REF:-main}"
 BPFTUNE_SRC_DIR="${BPFTUNE_SRC_DIR:-/usr/local/src/bpftune}"
 TCP_TUNE_ARGS_SEEN="no"
 TCP_TUNE_ONLY="${TCP_TUNE_ONLY:-no}"
-TUNE_BANDWIDTH="${TUNE_BANDWIDTH:-${BANDWIDTH:-500}}"
-TUNE_REGION="${TUNE_REGION:-${REGION:-asia}}"
+TUNE_BANDWIDTH="${TUNE_BANDWIDTH:-${BANDWIDTH:-auto}}"
+TUNE_REGION="${TUNE_REGION:-${REGION:-auto}}"
+TUNE_BANDWIDTH_SOURCE="configured"
+TUNE_REGION_SOURCE="configured"
+TUNE_COUNTRY_CODE=""
+TUNE_DEFAULT_IFACE=""
 DRY_RUN="${DRY_RUN:-no}"
 TC_IFACE="${TC_IFACE:-}"
 TC_RATE="${TC_RATE:-}"
@@ -32,7 +36,7 @@ usage() {
   cat <<'USAGE'
 Usage:
   sudo bash vps-firstboot.sh --port <ssh-port> --public-key 'ssh-ed25519 AAAA...'
-  sudo bash vps-firstboot.sh --bandwidth 1000 --region asia
+  sudo bash vps-firstboot.sh --bandwidth auto --region auto
 
 Options:
   --user NAME           Existing SSH user to install the key for. Default: root
@@ -56,8 +60,8 @@ Options:
   --bpftune-src DIR     bpftune source checkout directory. Default: /usr/local/src/bpftune
   --network-only        Only apply network optimization; skip SSH hardening
   --tcp-tune-only       Alias of --network-only
-  --bandwidth MBPS      TCP tuning profile bandwidth. Examples: 500, 1000. Default: 500
-  --region REGION       TCP tuning profile region: asia or overseas. "oversea" is accepted as overseas. Default: asia
+  --bandwidth MBPS      TCP tuning profile bandwidth. Examples: auto, 500, 1000. Default: auto
+  --region REGION       TCP tuning profile region: auto, asia, or overseas. "oversea" is accepted as overseas. Default: auto
   --dry-run             Preview TCP tuning files without applying changes
   --tc-iface IFACE      Configure optional egress shaping on this interface
   --tc-rate RATE        Egress shaping rate, for example 97mbit
@@ -79,7 +83,7 @@ What this script does:
   3. disable SSH password login
   4. keep root login key-only
   5. enable Linux TCP BBR with fq qdisc by default
-  6. apply a region/bandwidth TCP tuning profile by default
+  6. auto-detect region/bandwidth and apply a matching TCP tuning profile by default
   7. configure a UTF-8 system locale and avoid invalid SSH LC_* imports
   8. optionally build and enable bpftune for BPF-driven Linux auto-tuning
   9. optionally install fail2ban and protect the SSH port
@@ -121,6 +125,109 @@ normalize_region() {
       TUNE_REGION="overseas"
       ;;
   esac
+}
+
+default_route_iface() {
+  ip route show default 2>/dev/null | awk 'NR == 1 {print $5; exit}'
+}
+
+fetch_url_quiet() {
+  local url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 2 --max-time 4 "$url" 2>/dev/null || true
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- --timeout=4 "$url" 2>/dev/null || true
+  fi
+}
+
+detect_country_code() {
+  local body
+  local code
+
+  body="$(fetch_url_quiet https://ifconfig.co/country-iso | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]' || true)"
+  if [[ "$body" =~ ^[A-Z]{2}$ ]]; then
+    printf '%s\n' "$body"
+    return 0
+  fi
+
+  body="$(fetch_url_quiet https://ipinfo.io/country | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]' || true)"
+  if [[ "$body" =~ ^[A-Z]{2}$ ]]; then
+    printf '%s\n' "$body"
+    return 0
+  fi
+
+  body="$(fetch_url_quiet https://www.cloudflare.com/cdn-cgi/trace || true)"
+  code="$(printf '%s\n' "$body" | awk -F= '/^loc=/ {print toupper($2); exit}')"
+  if [[ "$code" =~ ^[A-Z]{2}$ ]]; then
+    printf '%s\n' "$code"
+    return 0
+  fi
+
+  return 1
+}
+
+country_to_region() {
+  local country="$1"
+  case "$country" in
+    AF|AM|AZ|BD|BN|BT|CC|CN|CX|GE|HK|ID|IN|IO|JP|KG|KH|KP|KR|KZ|LA|LK|MM|MN|MO|MV|MY|NP|PH|PK|SG|TH|TJ|TL|TM|TW|UZ|VN|AU|FJ|FM|GU|KI|MH|MP|NC|NF|NR|NU|NZ|PF|PG|PN|PW|SB|TK|TO|TV|VU|WF|WS)
+      printf '%s\n' asia
+      ;;
+    *)
+      printf '%s\n' overseas
+      ;;
+  esac
+}
+
+detect_bandwidth_mbps() {
+  local iface="$1"
+  local speed_file
+  local speed
+
+  if [[ -n "$iface" ]]; then
+    speed_file="/sys/class/net/$iface/speed"
+    if [[ -r "$speed_file" ]]; then
+      speed="$(cat "$speed_file" 2>/dev/null || true)"
+      if [[ "$speed" =~ ^[0-9]+$ ]] && (( speed >= 1 && speed <= 100000 )); then
+        printf '%s\n' "$speed"
+        return 0
+      fi
+    fi
+  fi
+
+  return 1
+}
+
+resolve_auto_profile() {
+  local detected_bandwidth
+
+  if [[ "$TUNE_REGION" == "auto" ]]; then
+    TUNE_COUNTRY_CODE="$(detect_country_code || true)"
+    if [[ -n "$TUNE_COUNTRY_CODE" ]]; then
+      TUNE_REGION="$(country_to_region "$TUNE_COUNTRY_CODE")"
+      TUNE_REGION_SOURCE="auto-country:$TUNE_COUNTRY_CODE"
+    else
+      TUNE_REGION="asia"
+      TUNE_REGION_SOURCE="fallback"
+      log "warning: could not detect VPS country; using region=asia"
+    fi
+  fi
+
+  if [[ "$TUNE_BANDWIDTH" == "auto" ]]; then
+    TUNE_DEFAULT_IFACE="$(default_route_iface || true)"
+    detected_bandwidth="$(detect_bandwidth_mbps "$TUNE_DEFAULT_IFACE" || true)"
+    if [[ -n "$detected_bandwidth" ]]; then
+      TUNE_BANDWIDTH="$detected_bandwidth"
+      TUNE_BANDWIDTH_SOURCE="auto-iface:${TUNE_DEFAULT_IFACE:-unknown}"
+    elif [[ "$TUNE_REGION" == "overseas" ]]; then
+      TUNE_BANDWIDTH=1000
+      TUNE_BANDWIDTH_SOURCE="fallback"
+      log "warning: could not detect NIC speed; using bandwidth=1000 for overseas"
+    else
+      TUNE_BANDWIDTH=500
+      TUNE_BANDWIDTH_SOURCE="fallback"
+      log "warning: could not detect NIC speed; using bandwidth=500 for asia"
+    fi
+  fi
 }
 
 locale_plan_value() {
@@ -290,6 +397,7 @@ validate_inputs() {
   fi
 
   normalize_region
+  resolve_auto_profile
 
   [[ "$COPY_ROOT_KEYS" =~ ^(yes|no)$ ]] || die "COPY_ROOT_KEYS must be yes or no"
   [[ "$ENABLE_FAIL2BAN" =~ ^(yes|no)$ ]] || die "ENABLE_FAIL2BAN must be yes or no"
@@ -935,7 +1043,9 @@ Dry run: TCP tuning preview only. No files will be written and no sysctl/tc chan
 
 Profile:
   region:           $TUNE_REGION
+  region source:    $TUNE_REGION_SOURCE
   bandwidth:        ${TUNE_BANDWIDTH}Mbps
+  bandwidth source: $TUNE_BANDWIDTH_SOURCE
   bbr + fq:         $ENABLE_BBR_FQ
   tcp sysctl:       $ENABLE_VPS_SYSCTL
   locale fix:       $(locale_plan_value)
@@ -987,6 +1097,7 @@ Plan:
   locale fix:       $(locale_plan_value)
   bpftune:          $ENABLE_BPFTUNE
   tcp profile:      $TUNE_REGION / ${TUNE_BANDWIDTH}Mbps
+  profile source:   $TUNE_REGION_SOURCE / $TUNE_BANDWIDTH_SOURCE
   fail2ban:        $ENABLE_FAIL2BAN
   tc shaping:       ${TC_IFACE:-disabled}${TC_RATE:+ @ $TC_RATE}
 
@@ -1003,6 +1114,7 @@ Plan:
   locale fix:       $(locale_plan_value)
   bpftune:          $ENABLE_BPFTUNE
   tcp profile:      $TUNE_REGION / ${TUNE_BANDWIDTH}Mbps
+  profile source:   $TUNE_REGION_SOURCE / $TUNE_BANDWIDTH_SOURCE
   tc shaping:       ${TC_IFACE:-disabled}${TC_RATE:+ @ $TC_RATE}
 
 PLAN
@@ -1034,6 +1146,10 @@ show_verification_status() {
   fi
   printf 'system_locale: %s\n' "$(awk -F= '/^LANG=/ {gsub(/"/, "", $2); print $2; found=1} END{if(!found) print "unknown"}' /etc/default/locale 2>/dev/null || echo unknown)"
   printf 'locale_check_skip: %s\n' "$([[ -e /var/lib/cloud/instance/locale-check.skip ]] && echo yes || echo no)"
+  printf 'tcp_profile: %s/%sMbps\n' "$TUNE_REGION" "$TUNE_BANDWIDTH"
+  printf 'tcp_profile_source: %s/%s\n' "$TUNE_REGION_SOURCE" "$TUNE_BANDWIDTH_SOURCE"
+  printf 'tcp_profile_country: %s\n' "${TUNE_COUNTRY_CODE:-unknown}"
+  printf 'tcp_profile_iface: %s\n' "${TUNE_DEFAULT_IFACE:-unknown}"
   printf 'bbr_available: %s\n' "$bbr_available"
   printf 'default_qdisc: %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
   printf 'tcp_congestion_control: %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
