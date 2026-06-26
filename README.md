@@ -15,7 +15,7 @@
 - SSH 端口改到你指定的值
 - 修复 Debian/Ubuntu 上常见的 SSH 登录 locale 警告
 - 默认开启 Linux TCP `BBR + fq`
-- 默认按地区和带宽应用 VPS TCP/sysctl 优化
+- 默认自动识别地区和网卡带宽，并应用 VPS TCP/sysctl 优化
 - 可选安装并启用 `bpftune`，让 Linux 通过 BPF 做长期自动调优
 - 可选配置 `tc` 出口整形，适合已测出链路上限的机器
 - 写入 `/etc/sysctl.d/99-vps-tcp-tune.conf`
@@ -31,6 +31,7 @@
 
 - `curl`
 - `wget`
+- `ca-certificates`
 - `tar`
 - `bash`
 - 如果要用 `tc` 整形，还需要 `iproute2`
@@ -42,7 +43,7 @@
 
 ```bash
 apt update
-apt install -y curl wget tar xz-utils gzip coreutils util-linux bash iproute2
+apt install -y curl wget ca-certificates tar xz-utils gzip coreutils util-linux bash iproute2
 ```
 
 ### Rocky / Alma / CentOS / Oracle Linux
@@ -82,31 +83,34 @@ Debian / Ubuntu 新机器可以直接按下面这套跑，已包含 SSH 安全�
 
 ```bash
 apt update
-apt install -y curl wget tar xz-utils gzip coreutils util-linux bash iproute2 || true
+apt install -y curl wget ca-certificates tar xz-utils gzip coreutils util-linux bash iproute2 || true
 
 curl -fsSL https://raw.githubusercontent.com/byethan/vps-firstboot/main/vps-firstboot.sh -o /root/vps-firstboot.sh || \
 wget -O /root/vps-firstboot.sh https://raw.githubusercontent.com/byethan/vps-firstboot/main/vps-firstboot.sh
 
 bash /root/vps-firstboot.sh \
   --port 20022 \
-  --bandwidth 1000 \
-  --region asia \
   --public-key 'ssh-ed25519 AAAA... your-key-comment' \
   -y
 ```
 
-如果这台是亚洲 500M，把这两行改成：
+默认会自动选择 `--region auto --bandwidth auto`：
+
+- 地区：用 VPS 公网 IP 国家码判断，亚太归为 `asia`，其他区域归为 `overseas`
+- 带宽：优先读取默认路由网卡的 reported speed，例如 `100`、`625`、`1000`、`10000`
+- 如果地区识别失败，默认按 `asia`
+- 如果带宽识别失败，亚洲默认按 `500M`，海外默认按 `1000M`
+- 有些 VPS 虚拟网卡会统一上报 `10000M`，不一定等于商家套餐限速；脚本会显示 `tcp_profile_source`，发现不准时手动传 `--bandwidth`
+
+如果想手动指定，仍然可以覆盖：
 
 ```bash
-  --bandwidth 500 \
+bash /root/vps-firstboot.sh \
+  --port 20022 \
+  --bandwidth 625 \
   --region asia \
-```
-
-如果是欧美 1000M，把这两行改成：
-
-```bash
-  --bandwidth 1000 \
-  --region overseas \
+  --public-key 'ssh-ed25519 AAAA... your-key-comment' \
+  -y
 ```
 
 通用写法是先确认你本地有 SSH 公钥：
@@ -120,8 +124,6 @@ cat ~/.ssh/id_ed25519.pub
 ```bash
 sudo bash vps-firstboot.sh \
   --port <ssh-port> \
-  --bandwidth 500 \
-  --region asia \
   --public-key 'ssh-ed25519 AAAA... your-key-comment'
 ```
 
@@ -130,8 +132,6 @@ sudo bash vps-firstboot.sh \
 ```bash
 bash /root/vps-firstboot.sh \
   --port <ssh-port> \
-  --bandwidth 500 \
-  --region asia \
   --public-key 'ssh-ed25519 AAAA... your-key-comment'
 ```
 
@@ -161,15 +161,18 @@ sudo bash vps-firstboot.sh \
 网络优化可以单独跑，也可以和 SSH 加固一起跑。线路建议：
 
 ```bash
-# 亚洲线路：港 / 日 / 韩 / 新加坡
+# 自动选择地区和带宽
+sudo bash vps-firstboot.sh --network-only
+
+# 手动指定亚洲线路：港 / 日 / 韩 / 新加坡
 sudo bash vps-firstboot.sh --bandwidth 500 --region asia
 sudo bash vps-firstboot.sh --bandwidth 1000 --region asia
 
-# 美国 / 欧洲线路
+# 手动指定美国 / 欧洲线路
 sudo bash vps-firstboot.sh --bandwidth 1000 --region overseas
 
 # 只预览配置，不应用
-bash vps-firstboot.sh --bandwidth 1000 --region asia --dry-run
+bash vps-firstboot.sh --dry-run
 ```
 
 脚本默认会开启系统级 Linux TCP `BBR + fq`，并写入一组按 `--region` 和 `--bandwidth` 选择的 TCP 参数。如果某台机器不想动网络队列和 TCP 拥塞控制，可以加：
@@ -273,6 +276,10 @@ ssh -p <ssh-port> root@SERVER_IP
 - `acceptenv`
 - `system_locale`
 - `locale_check_skip`
+- `tcp_profile`
+- `tcp_profile_source`
+- `tcp_profile_country`
+- `tcp_profile_iface`
 - `bbr_available`
 - `default_qdisc`
 - `tcp_congestion_control`
