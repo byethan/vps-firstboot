@@ -11,6 +11,12 @@ COPY_ROOT_KEYS="${COPY_ROOT_KEYS:-yes}"
 ENABLE_FAIL2BAN="${ENABLE_FAIL2BAN:-no}"
 ENABLE_BBR_FQ="${ENABLE_BBR_FQ:-yes}"
 ENABLE_VPS_SYSCTL="${ENABLE_VPS_SYSCTL:-yes}"
+ENABLE_LOCALE_FIX="${ENABLE_LOCALE_FIX:-yes}"
+SYSTEM_LOCALE="${SYSTEM_LOCALE:-en_US.UTF-8}"
+ENABLE_BPFTUNE="${ENABLE_BPFTUNE:-no}"
+BPFTUNE_REPO="${BPFTUNE_REPO:-https://github.com/byethan/bpftune.git}"
+BPFTUNE_REF="${BPFTUNE_REF:-main}"
+BPFTUNE_SRC_DIR="${BPFTUNE_SRC_DIR:-/usr/local/src/bpftune}"
 TCP_TUNE_ARGS_SEEN="no"
 TCP_TUNE_ONLY="${TCP_TUNE_ONLY:-no}"
 TUNE_BANDWIDTH="${TUNE_BANDWIDTH:-${BANDWIDTH:-500}}"
@@ -40,10 +46,18 @@ Options:
   --no-bbr-fq           Do not configure Linux TCP BBR with fq qdisc
   --enable-vps-sysctl   Apply TCP/sysctl tuning profile. Default: yes
   --no-vps-sysctl       Do not apply the TCP/sysctl tuning profile
+  --enable-locale-fix   Configure system UTF-8 locale and SSH locale handling. Default: yes
+  --no-locale-fix       Do not configure locale settings
+  --system-locale NAME  Locale to generate and set. Default: en_US.UTF-8
+  --enable-bpftune      Build, install, and enable bpftune BPF auto-tuning daemon
+  --no-bpftune          Do not install or enable bpftune. Default: no
+  --bpftune-repo URL    bpftune git repository. Default: https://github.com/byethan/bpftune.git
+  --bpftune-ref REF     bpftune git branch/tag/ref. Default: main
+  --bpftune-src DIR     bpftune source checkout directory. Default: /usr/local/src/bpftune
   --network-only        Only apply network optimization; skip SSH hardening
   --tcp-tune-only       Alias of --network-only
   --bandwidth MBPS      TCP tuning profile bandwidth. Examples: 500, 1000. Default: 500
-  --region REGION       TCP tuning profile region: asia or overseas. Default: asia
+  --region REGION       TCP tuning profile region: asia or overseas. "oversea" is accepted as overseas. Default: asia
   --dry-run             Preview TCP tuning files without applying changes
   --tc-iface IFACE      Configure optional egress shaping on this interface
   --tc-rate RATE        Egress shaping rate, for example 97mbit
@@ -54,8 +68,10 @@ Options:
 
 Environment variables with the same names also work:
   SSH_USER, SSH_PORT, PUBLIC_KEY, PUBLIC_KEY_FILE, COPY_ROOT_KEYS, ENABLE_FAIL2BAN,
-  ENABLE_BBR_FQ, ENABLE_VPS_SYSCTL, TCP_TUNE_ONLY, TUNE_BANDWIDTH, BANDWIDTH,
-  TUNE_REGION, REGION, DRY_RUN, TC_IFACE, TC_RATE, TC_MTU, TC_BURST, ASSUME_YES
+  ENABLE_BBR_FQ, ENABLE_VPS_SYSCTL, ENABLE_LOCALE_FIX, SYSTEM_LOCALE,
+  ENABLE_BPFTUNE, BPFTUNE_REPO, BPFTUNE_REF, BPFTUNE_SRC_DIR, TCP_TUNE_ONLY,
+  TUNE_BANDWIDTH, BANDWIDTH, TUNE_REGION, REGION, DRY_RUN, TC_IFACE, TC_RATE,
+  TC_MTU, TC_BURST, ASSUME_YES
 
 What this script does:
   1. install SSH public keys for an existing SSH user, root by default
@@ -64,9 +80,11 @@ What this script does:
   4. keep root login key-only
   5. enable Linux TCP BBR with fq qdisc by default
   6. apply a region/bandwidth TCP tuning profile by default
-  7. optionally install fail2ban and protect the SSH port
-  8. optionally configure tc egress shaping when iface and rate are supplied
-  9. create a systemd service to restore fq on the default route interface
+  7. configure a UTF-8 system locale and avoid invalid SSH LC_* imports
+  8. optionally build and enable bpftune for BPF-driven Linux auto-tuning
+  9. optionally install fail2ban and protect the SSH port
+  10. optionally configure tc egress shaping when iface and rate are supplied
+  11. create a systemd service to restore fq on the default route interface
 
 Important:
   Keep the current SSH session open. Open a second terminal and test:
@@ -95,6 +113,22 @@ confirm() {
 
 ssh_hardening_enabled() {
   [[ "$TCP_TUNE_ONLY" != "yes" ]]
+}
+
+normalize_region() {
+  case "$TUNE_REGION" in
+    oversea)
+      TUNE_REGION="overseas"
+      ;;
+  esac
+}
+
+locale_plan_value() {
+  if [[ "$ENABLE_LOCALE_FIX" == "yes" ]]; then
+    printf 'yes / %s\n' "$SYSTEM_LOCALE"
+  else
+    printf 'no\n'
+  fi
 }
 
 parse_args() {
@@ -147,6 +181,47 @@ parse_args() {
       --no-vps-sysctl)
         ENABLE_VPS_SYSCTL="no"
         shift
+        ;;
+      --enable-locale-fix)
+        ENABLE_LOCALE_FIX="yes"
+        shift
+        ;;
+      --no-locale-fix)
+        ENABLE_LOCALE_FIX="no"
+        shift
+        ;;
+      --system-locale)
+        [[ $# -ge 2 ]] || die "--system-locale requires a value"
+        SYSTEM_LOCALE="${2:-}"
+        shift 2
+        ;;
+      --enable-bpftune)
+        ENABLE_BPFTUNE="yes"
+        TCP_TUNE_ARGS_SEEN="yes"
+        shift
+        ;;
+      --no-bpftune)
+        ENABLE_BPFTUNE="no"
+        TCP_TUNE_ARGS_SEEN="yes"
+        shift
+        ;;
+      --bpftune-repo)
+        [[ $# -ge 2 ]] || die "--bpftune-repo requires a value"
+        BPFTUNE_REPO="${2:-}"
+        TCP_TUNE_ARGS_SEEN="yes"
+        shift 2
+        ;;
+      --bpftune-ref)
+        [[ $# -ge 2 ]] || die "--bpftune-ref requires a value"
+        BPFTUNE_REF="${2:-}"
+        TCP_TUNE_ARGS_SEEN="yes"
+        shift 2
+        ;;
+      --bpftune-src)
+        [[ $# -ge 2 ]] || die "--bpftune-src requires a value"
+        BPFTUNE_SRC_DIR="${2:-}"
+        TCP_TUNE_ARGS_SEEN="yes"
+        shift 2
         ;;
       --network-only|--tcp-tune-only)
         TCP_TUNE_ONLY="yes"
@@ -214,16 +289,24 @@ validate_inputs() {
     TCP_TUNE_ONLY="yes"
   fi
 
+  normalize_region
+
   [[ "$COPY_ROOT_KEYS" =~ ^(yes|no)$ ]] || die "COPY_ROOT_KEYS must be yes or no"
   [[ "$ENABLE_FAIL2BAN" =~ ^(yes|no)$ ]] || die "ENABLE_FAIL2BAN must be yes or no"
   [[ "$ENABLE_BBR_FQ" =~ ^(yes|no)$ ]] || die "ENABLE_BBR_FQ must be yes or no"
   [[ "$ENABLE_VPS_SYSCTL" =~ ^(yes|no)$ ]] || die "ENABLE_VPS_SYSCTL must be yes or no"
+  [[ "$ENABLE_LOCALE_FIX" =~ ^(yes|no)$ ]] || die "ENABLE_LOCALE_FIX must be yes or no"
+  [[ "$ENABLE_BPFTUNE" =~ ^(yes|no)$ ]] || die "ENABLE_BPFTUNE must be yes or no"
   [[ "$TCP_TUNE_ONLY" =~ ^(yes|no)$ ]] || die "TCP_TUNE_ONLY must be yes or no"
   [[ "$DRY_RUN" =~ ^(yes|no)$ ]] || die "DRY_RUN must be yes or no"
   [[ "$ASSUME_YES" =~ ^(yes|no)$ ]] || die "ASSUME_YES must be yes or no"
+  [[ "$SYSTEM_LOCALE" =~ ^[A-Za-z0-9_.@-]+$ ]] || die "--system-locale contains unsupported characters"
   [[ "$TUNE_REGION" =~ ^(asia|overseas)$ ]] || die "--region must be asia or overseas"
   [[ "$TUNE_BANDWIDTH" =~ ^[0-9]+$ ]] || die "--bandwidth must be a number in Mbps"
   (( TUNE_BANDWIDTH >= 1 && TUNE_BANDWIDTH <= 100000 )) || die "--bandwidth must be from 1 to 100000 Mbps"
+  [[ -n "$BPFTUNE_REPO" && "$BPFTUNE_REPO" != *[[:space:]]* ]] || die "--bpftune-repo must be a non-empty URL/path without whitespace"
+  [[ "$BPFTUNE_REF" =~ ^[A-Za-z0-9._/@+-]+$ ]] || die "--bpftune-ref contains unsupported characters"
+  [[ "$BPFTUNE_SRC_DIR" == /* ]] || die "--bpftune-src must be an absolute path"
 
   if [[ "$DRY_RUN" != "yes" ]]; then
     [[ "$(id -u)" -eq 0 ]] || die "run as root, for example: sudo bash $SCRIPT_NAME"
@@ -303,7 +386,7 @@ comment_global_sshd_directives() {
   tmp_file="$(mktemp)"
   awk '
     BEGIN {
-      split("Port PubkeyAuthentication PasswordAuthentication KbdInteractiveAuthentication ChallengeResponseAuthentication PermitRootLogin PermitEmptyPasswords AllowUsers", keys)
+      split("Port PubkeyAuthentication PasswordAuthentication KbdInteractiveAuthentication ChallengeResponseAuthentication PermitRootLogin PermitEmptyPasswords AllowUsers UseDNS AcceptEnv", keys)
       for (i in keys) managed[tolower(keys[i])] = 1
       in_match = 0
     }
@@ -358,6 +441,8 @@ ChallengeResponseAuthentication no
 PermitRootLogin prohibit-password
 PermitEmptyPasswords no
 AllowUsers $SSH_USER
+UseDNS no
+AcceptEnv LANG
 SSHD
 
   cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
@@ -744,6 +829,105 @@ FAIL2BAN
   fi
 }
 
+configure_locale() {
+  local locale_file="/etc/default/locale"
+
+  if [[ "$ENABLE_LOCALE_FIX" != "yes" ]]; then
+    return 0
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    if ! command -v locale-gen >/dev/null 2>&1; then
+      apt-get update
+      apt-get install -y locales
+    fi
+
+    if [[ -f /etc/locale.gen ]] && ! grep -Eq "^[[:space:]]*$SYSTEM_LOCALE[[:space:]]+UTF-8" /etc/locale.gen; then
+      printf '%s UTF-8\n' "$SYSTEM_LOCALE" >>/etc/locale.gen
+    fi
+
+    locale-gen >/dev/null 2>&1 || log "warning: failed to generate locale $SYSTEM_LOCALE"
+
+    if command -v update-locale >/dev/null 2>&1; then
+      update-locale LANG="$SYSTEM_LOCALE" LC_CTYPE="$SYSTEM_LOCALE" || log "warning: failed to update system locale"
+    else
+      install -d -m 0755 /etc/default
+      printf 'LANG=%s\nLC_CTYPE=%s\n' "$SYSTEM_LOCALE" "$SYSTEM_LOCALE" >"$locale_file"
+    fi
+  elif command -v localectl >/dev/null 2>&1; then
+    localectl set-locale LANG="$SYSTEM_LOCALE" LC_CTYPE="$SYSTEM_LOCALE" || log "warning: failed to set locale with localectl"
+  else
+    log "warning: locale configuration skipped because no supported locale tool was found"
+  fi
+
+  if [[ -d /var/lib/cloud/instance ]]; then
+    touch /var/lib/cloud/instance/locale-check.skip 2>/dev/null || true
+  fi
+}
+
+install_bpftune_build_deps() {
+  if command -v apt-get >/dev/null 2>&1; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y git make gcc pkg-config clang llvm bpftool libbpf-dev libcap-dev libnl-3-dev libnl-route-3-dev python3-docutils
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y git make gcc pkgconf-pkg-config clang llvm bpftool libbpf-devel libcap-devel libnl3-devel python3-docutils
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y git make gcc pkgconfig clang llvm bpftool libbpf-devel libcap-devel libnl3-devel python3-docutils
+  else
+    die "cannot install bpftune build dependencies automatically on this system; unsupported package manager"
+  fi
+}
+
+bpftune_libdir() {
+  if [[ -f /etc/debian_version ]]; then
+    printf '%s\n' lib
+  else
+    printf '%s\n' lib64
+  fi
+}
+
+install_bpftune() {
+  local jobs
+  local libdir
+  local src_parent
+
+  if [[ "$ENABLE_BPFTUNE" != "yes" ]]; then
+    return 0
+  fi
+
+  command -v systemctl >/dev/null 2>&1 || die "bpftune service management requires systemd/systemctl"
+  [[ -e /sys/kernel/btf/vmlinux || -e "/boot/vmlinux-$(uname -r)" ]] || die "bpftune requires kernel BTF; /sys/kernel/btf/vmlinux is missing"
+
+  install_bpftune_build_deps
+
+  src_parent="$(dirname "$BPFTUNE_SRC_DIR")"
+  install -d -m 0755 "$src_parent"
+
+  if [[ -d "$BPFTUNE_SRC_DIR/.git" ]]; then
+    git -C "$BPFTUNE_SRC_DIR" fetch --depth 1 origin "$BPFTUNE_REF"
+  elif [[ -e "$BPFTUNE_SRC_DIR" ]]; then
+    die "bpftune source path exists but is not a git checkout: $BPFTUNE_SRC_DIR"
+  else
+    git clone --depth 1 "$BPFTUNE_REPO" "$BPFTUNE_SRC_DIR"
+    git -C "$BPFTUNE_SRC_DIR" fetch --depth 1 origin "$BPFTUNE_REF"
+  fi
+
+  git -C "$BPFTUNE_SRC_DIR" checkout --detach FETCH_HEAD
+
+  jobs="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '2')"
+  [[ "$jobs" =~ ^[0-9]+$ ]] || jobs=2
+  libdir="$(bpftune_libdir)"
+
+  make -C "$BPFTUNE_SRC_DIR" -j "$jobs" libdir="$libdir" srcdir docdir
+  make -C "$BPFTUNE_SRC_DIR" libdir="$libdir" install
+
+  bpftune -S
+  systemctl daemon-reload || log "warning: failed to reload systemd after installing bpftune"
+  systemctl enable --now bpftune.service
+}
+
 print_tcp_tune_dry_run() {
   cat <<DRYRUN
 
@@ -754,6 +938,8 @@ Profile:
   bandwidth:        ${TUNE_BANDWIDTH}Mbps
   bbr + fq:         $ENABLE_BBR_FQ
   tcp sysctl:       $ENABLE_VPS_SYSCTL
+  locale fix:       $(locale_plan_value)
+  bpftune:          $ENABLE_BPFTUNE
   tc shaping:       ${TC_IFACE:-disabled}${TC_RATE:+ @ $TC_RATE}
 
 Would write /etc/sysctl.d/99-vps-tcp-tune.conf:
@@ -774,6 +960,17 @@ Would write tc shaping files:
   /etc/systemd/system/vps-tc-shape.service
 TC_PREVIEW
   fi
+
+  if [[ "$ENABLE_BPFTUNE" == "yes" ]]; then
+    cat <<BPFTUNE_PREVIEW
+
+Would build/install bpftune:
+  repo: $BPFTUNE_REPO
+  ref:  $BPFTUNE_REF
+  src:  $BPFTUNE_SRC_DIR
+  service: bpftune.service
+BPFTUNE_PREVIEW
+  fi
 }
 
 print_plan() {
@@ -787,6 +984,8 @@ Plan:
   copy root keys:  $COPY_ROOT_KEYS
   bbr + fq:         $ENABLE_BBR_FQ
   tcp sysctl:       $ENABLE_VPS_SYSCTL
+  locale fix:       $(locale_plan_value)
+  bpftune:          $ENABLE_BPFTUNE
   tcp profile:      $TUNE_REGION / ${TUNE_BANDWIDTH}Mbps
   fail2ban:        $ENABLE_FAIL2BAN
   tc shaping:       ${TC_IFACE:-disabled}${TC_RATE:+ @ $TC_RATE}
@@ -801,6 +1000,8 @@ Plan:
   ssh hardening:    no
   bbr + fq:         $ENABLE_BBR_FQ
   tcp sysctl:       $ENABLE_VPS_SYSCTL
+  locale fix:       $(locale_plan_value)
+  bpftune:          $ENABLE_BPFTUNE
   tcp profile:      $TUNE_REGION / ${TUNE_BANDWIDTH}Mbps
   tc shaping:       ${TC_IFACE:-disabled}${TC_RATE:+ @ $TC_RATE}
 
@@ -828,7 +1029,11 @@ show_verification_status() {
     printf 'passwordauthentication: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^passwordauthentication / {print $2; exit}')"
     printf 'permitrootlogin: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^permitrootlogin / {print $2; exit}')"
     printf 'allowusers: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^allowusers / {$1=""; sub(/^ /, ""); print; exit}')"
+    printf 'usedns: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^usedns / {print $2; exit}')"
+    printf 'acceptenv: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^acceptenv / {$1=""; sub(/^ /, ""); print; exit}')"
   fi
+  printf 'system_locale: %s\n' "$(awk -F= '/^LANG=/ {gsub(/"/, "", $2); print $2; found=1} END{if(!found) print "unknown"}' /etc/default/locale 2>/dev/null || echo unknown)"
+  printf 'locale_check_skip: %s\n' "$([[ -e /var/lib/cloud/instance/locale-check.skip ]] && echo yes || echo no)"
   printf 'bbr_available: %s\n' "$bbr_available"
   printf 'default_qdisc: %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
   printf 'tcp_congestion_control: %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
@@ -843,6 +1048,15 @@ show_verification_status() {
   printf 'ip_local_port_range: %s\n' "$(sysctl -n net.ipv4.ip_local_port_range 2>/dev/null || echo unknown)"
   printf 'somaxconn: %s\n' "$(sysctl -n net.core.somaxconn 2>/dev/null || echo unknown)"
   printf 'fq_restore_service: %s\n' "$(systemctl is-enabled vps-fq-restore.service 2>/dev/null || echo unavailable)"
+
+  if [[ "$ENABLE_BPFTUNE" == "yes" || -x "$(command -v bpftune || true)" ]]; then
+    printf 'bpftune_binary: %s\n' "$(command -v bpftune 2>/dev/null || echo not-installed)"
+    if command -v systemctl >/dev/null 2>&1; then
+      printf 'bpftune_service: %s/%s\n' "$(systemctl is-enabled bpftune.service 2>/dev/null || echo unavailable)" "$(systemctl is-active bpftune.service 2>/dev/null || echo inactive)"
+    else
+      printf 'bpftune_service: %s\n' "unavailable"
+    fi
+  fi
 
   for iface in $default_ifaces; do
     printf 'tc_qdisc_%s: %s\n' "$iface" "$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1 {print; found=1} END{if(!found) print "unknown"}')"
@@ -914,8 +1128,10 @@ main() {
     configure_sshd
   fi
 
+  configure_locale
   configure_tcp_tune
   configure_tc_shaping
+  install_bpftune
   install_fail2ban
   show_verification_status
   final_message
