@@ -19,6 +19,7 @@ BDP_BUFFER_BYTES=""
 ENABLE_LOCALE_FIX="${ENABLE_LOCALE_FIX:-yes}"
 SYSTEM_LOCALE="${SYSTEM_LOCALE:-en_US.UTF-8}"
 ENABLE_PREFER_IPV4="${ENABLE_PREFER_IPV4:-yes}"
+ENABLE_BBRV3_KERNEL="${ENABLE_BBRV3_KERNEL:-yes}"
 ENABLE_BPFTUNE="${ENABLE_BPFTUNE:-no}"
 BPFTUNE_REPO="${BPFTUNE_REPO:-https://github.com/byethan/bpftune.git}"
 BPFTUNE_REF="${BPFTUNE_REF:-main}"
@@ -79,6 +80,8 @@ Options:
   --system-locale NAME  Locale to generate and set. Default: en_US.UTF-8
   --prefer-ipv4         Prefer IPv4 when hostnames have both A and AAAA records. Default: yes
   --no-prefer-ipv4      Do not configure /etc/gai.conf IPv4 preference
+  --enable-bbrv3-kernel Install standard BBRv3 kernel during normal setup. Default: yes
+  --no-bbrv3-kernel     Skip BBRv3 kernel install during normal setup
   --enable-bpftune      Build, install, and enable bpftune BPF auto-tuning daemon
   --no-bpftune          Do not install or enable bpftune. Default: no
   --bpftune-repo URL    bpftune git repository. Default: https://github.com/byethan/bpftune.git
@@ -107,7 +110,7 @@ Options:
 Environment variables with the same names also work:
   SSH_USER, SSH_PORT, PUBLIC_KEY, PUBLIC_KEY_FILE, COPY_ROOT_KEYS, ENABLE_FAIL2BAN,
   ENABLE_BBR_FQ, ENABLE_VPS_SYSCTL, ENABLE_LOCALE_FIX, SYSTEM_LOCALE,
-  ENABLE_PREFER_IPV4,
+  ENABLE_PREFER_IPV4, ENABLE_BBRV3_KERNEL,
   ENABLE_BDP_TUNE, BDP_BANDWIDTH_MBPS, BDP_RTT_MS, BDP_EXTRA_MIB,
   ENABLE_BPFTUNE, BPFTUNE_REPO, BPFTUNE_REF, BPFTUNE_SRC_DIR, TCP_TUNE_ONLY,
   TUNE_BANDWIDTH, BANDWIDTH, TUNE_REGION, REGION, DRY_RUN, TC_IFACE, TC_RATE,
@@ -124,10 +127,11 @@ What this script does:
   7. optionally write BDP-based TCP buffer values when bandwidth and RTT are supplied
   8. configure a UTF-8 system locale and avoid invalid SSH LC_* imports
   9. prefer IPv4 for dual-stack hostname resolution without disabling IPv6
-  10. optionally build and enable bpftune for BPF-driven Linux auto-tuning
-  11. optionally install fail2ban and protect the SSH port
-  12. optionally configure tc egress shaping when iface and rate are supplied
-  13. create a systemd service to restore fq on the default route interface
+  10. install standard BBRv3 kernel by default, without automatic reboot
+  11. optionally build and enable bpftune for BPF-driven Linux auto-tuning
+  12. optionally install fail2ban and protect the SSH port
+  13. optionally configure tc egress shaping when iface and rate are supplied
+  14. create a systemd service to restore fq on the default route interface
 
 BBRv3 subcommands:
   install   Install the standard BBRv3 kernel from GitHub Releases, enable BBR + fq,
@@ -413,6 +417,14 @@ parse_args() {
         TCP_TUNE_ARGS_SEEN="yes"
         shift
         ;;
+      --enable-bbrv3-kernel)
+        ENABLE_BBRV3_KERNEL="yes"
+        shift
+        ;;
+      --no-bbrv3-kernel)
+        ENABLE_BBRV3_KERNEL="no"
+        shift
+        ;;
       --enable-bpftune)
         ENABLE_BPFTUNE="yes"
         TCP_TUNE_ARGS_SEEN="yes"
@@ -556,6 +568,7 @@ validate_inputs() {
   [[ "$ENABLE_BDP_TUNE" =~ ^(yes|no)$ ]] || die "ENABLE_BDP_TUNE must be yes or no"
   [[ "$ENABLE_LOCALE_FIX" =~ ^(yes|no)$ ]] || die "ENABLE_LOCALE_FIX must be yes or no"
   [[ "$ENABLE_PREFER_IPV4" =~ ^(yes|no)$ ]] || die "ENABLE_PREFER_IPV4 must be yes or no"
+  [[ "$ENABLE_BBRV3_KERNEL" =~ ^(yes|no)$ ]] || die "ENABLE_BBRV3_KERNEL must be yes or no"
   [[ "$ENABLE_BPFTUNE" =~ ^(yes|no)$ ]] || die "ENABLE_BPFTUNE must be yes or no"
   [[ "$TCP_TUNE_ONLY" =~ ^(yes|no)$ ]] || die "TCP_TUNE_ONLY must be yes or no"
   [[ "$DRY_RUN" =~ ^(yes|no)$ ]] || die "DRY_RUN must be yes or no"
@@ -1726,6 +1739,7 @@ Profile:
   bdp tune:         $(bdp_plan_value)
   locale fix:       $(locale_plan_value)
   ipv4 preference:  $(ipv4_preference_plan_value)
+  bbrv3 kernel:     $ENABLE_BBRV3_KERNEL / $BBRV3_FLAVOR / ${BBRV3_VERSION:-locked-or-latest}
   bpftune:          $ENABLE_BPFTUNE
   tc shaping:       ${TC_IFACE:-disabled}${TC_RATE:+ @ $TC_RATE}
 
@@ -1742,6 +1756,17 @@ DRYRUN
   if [[ "$ENABLE_BBR_FQ" == "yes" ]]; then
     printf '\nWould write fq restore files:\n'
     print_fq_restore_files
+  fi
+
+  if [[ "$ENABLE_BBRV3_KERNEL" == "yes" ]]; then
+    cat <<BBRV3_PREVIEW
+
+Would install standard BBRv3 kernel packages from GitHub Releases:
+  repo: $BBRV3_REPO
+  version: ${BBRV3_VERSION:-locked tag if present, otherwise latest standard release}
+  lock version: $BBRV3_LOCK_VERSION
+  automatic reboot: no
+BBRV3_PREVIEW
   fi
 
   if [[ -n "$TC_IFACE" && -n "$TC_RATE" ]]; then
@@ -1780,6 +1805,7 @@ Plan:
   bdp tune:         $(bdp_plan_value)
   locale fix:       $(locale_plan_value)
   ipv4 preference:  $(ipv4_preference_plan_value)
+  bbrv3 kernel:     $ENABLE_BBRV3_KERNEL / $BBRV3_FLAVOR / ${BBRV3_VERSION:-locked-or-latest}
   bpftune:          $ENABLE_BPFTUNE
   tcp profile:      $TUNE_REGION / ${TUNE_BANDWIDTH}Mbps
   profile source:   $TUNE_REGION_SOURCE / $TUNE_BANDWIDTH_SOURCE
@@ -1799,6 +1825,7 @@ Plan:
   bdp tune:         $(bdp_plan_value)
   locale fix:       $(locale_plan_value)
   ipv4 preference:  $(ipv4_preference_plan_value)
+  bbrv3 kernel:     $ENABLE_BBRV3_KERNEL / $BBRV3_FLAVOR / ${BBRV3_VERSION:-locked-or-latest}
   bpftune:          $ENABLE_BPFTUNE
   tcp profile:      $TUNE_REGION / ${TUNE_BANDWIDTH}Mbps
   profile source:   $TUNE_REGION_SOURCE / $TUNE_BANDWIDTH_SOURCE
@@ -1904,6 +1931,18 @@ The current TCP/network verification status is shown above.
 DONE
   fi
 
+  if [[ "$BBRV3_NEEDS_REBOOT" == "yes" ]]; then
+    cat <<BBRV3_DONE
+
+BBRv3 kernel packages are installed, but this script did not reboot automatically.
+Reboot during your maintenance window:
+  reboot
+
+After reboot, verify:
+  bash /root/vps-firstboot.sh check
+BBRV3_DONE
+  fi
+
   if [[ "$ENABLE_BDP_TUNE" == "yes" ]]; then
     cat <<BDP_DONE
 
@@ -1953,6 +1992,9 @@ main() {
   configure_tc_shaping
   install_bpftune
   install_fail2ban
+  if [[ "$ENABLE_BBRV3_KERNEL" == "yes" ]]; then
+    bbrv3_install
+  fi
   show_verification_status
   final_message
 }

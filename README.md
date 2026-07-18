@@ -17,6 +17,7 @@
 - 默认配置双栈域名优先 IPv4，不关闭 IPv6
 - 默认开启 Linux TCP `BBR + fq`
 - 支持 `install` / `check` / `rollback` 无人值守管理 BBRv3 标准版内核
+- 普通一键初始化默认也会安装 BBRv3 标准版内核，但不会自动重启
 - 支持锁定 BBRv3 内核版本，适合多台 VPS 分批升级
 - 默认只写入最小 TCP/sysctl 基线：`net.core.default_qdisc=fq` 和 `net.ipv4.tcp_congestion_control=bbr`
 - 可选安装并启用 `bpftune`，让 Linux 通过 BPF 做长期自动调优
@@ -84,7 +85,7 @@ uname -a
 
 ### 最新版一键执行
 
-Debian / Ubuntu 新机器可以直接按下面这套跑，已包含 SSH 安全加固和网络优化：
+Debian / Ubuntu 新机器可以直接按下面这套跑，已包含 SSH 安全加固、网络优化、locale 修复、IPv4 优先策略和 BBRv3 标准版内核安装：
 
 ```bash
 apt update
@@ -97,6 +98,24 @@ bash /root/vps-firstboot.sh \
   --port 22928 \
   --public-key 'ssh-ed25519 AAAA... your-key-comment' \
   -y
+```
+
+脚本不会自动重启。跑完确认新 SSH 端口能登录后，再安排重启切到 BBRv3 内核：
+
+```bash
+reboot
+```
+
+重启后检查：
+
+```bash
+bash /root/vps-firstboot.sh check
+```
+
+如果这次只想做 SSH/基础网络初始化，不安装 BBRv3 内核，加：
+
+```bash
+  --no-bbrv3-kernel \
 ```
 
 默认会自动选择 `--region auto --bandwidth auto`：
@@ -259,7 +278,7 @@ iperf3 -c SERVER_IP -R -t 30
 
 ## BBRv3 内核管理
 
-脚本支持无人值守安装 BBRv3 标准版内核，并默认启用 `BBR + fq`。安装阶段不会自动重启，原系统内核也不会被删除，方便在面板或 GRUB 里回退。
+脚本支持无人值守安装 BBRv3 标准版内核，并默认启用 `BBR + fq`。普通初始化流程已经默认包含这一步；也可以单独使用 `install` 子命令给已初始化的老机器补装/升级内核。安装阶段不会自动重启，原系统内核也不会被删除，方便在面板或 GRUB 里回退。
 
 上游来源是 `byJoey/Actions-bbr-v3` 的 GitHub Releases。上游主脚本仍以交互菜单为主；这里不模拟菜单按键，而是直接用 Releases API 选择标准版 `.deb` 内核包安装。
 
