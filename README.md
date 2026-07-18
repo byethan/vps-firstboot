@@ -5,7 +5,7 @@
 1. 先补基础工具，确保能下载脚本、能跑后续检查
 2. 再执行一键脚本做 SSH 加固
 3. 按验收清单确认 SSH 状态
-4. 最后再跑 `nq`
+4. 最后在落地机上跑大站延迟检测
 
 脚本本身只做这几件事：
 
@@ -14,11 +14,15 @@
 - root 只允许密钥登录
 - SSH 端口改到你指定的值
 - 修复 Debian/Ubuntu 上常见的 SSH 登录 locale 警告
+- 默认配置双栈域名优先 IPv4，不关闭 IPv6
 - 默认开启 Linux TCP `BBR + fq`
-- 默认自动识别地区和网卡带宽，并应用 VPS TCP/sysctl 优化
+- 支持 `install` / `check` / `rollback` 无人值守管理 BBRv3 标准版内核
+- 支持锁定 BBRv3 内核版本，适合多台 VPS 分批升级
+- 默认只写入最小 TCP/sysctl 基线：`net.core.default_qdisc=fq` 和 `net.ipv4.tcp_congestion_control=bbr`
 - 可选安装并启用 `bpftune`，让 Linux 通过 BPF 做长期自动调优
 - 可选配置 `tc` 出口整形，适合已测出链路上限的机器
-- 写入 `/etc/sysctl.d/99-vps-tcp-tune.conf`
+- 写入 `/etc/sysctl.d/90-vps-bbr-fq.conf`
+- 自动禁用旧版 `/etc/sysctl.d/99-vps-tcp-tune.conf`，避免残留的大 buffer/backlog 参数继续生效
 - 创建 `vps-fq-restore.service`，重启后自动恢复默认路由网卡的 `fq` 队列
 - 可选安装并配置 `fail2ban` 保护 SSH 端口
 - 处理 `ssh.socket` 仍监听 22 的问题
@@ -34,34 +38,35 @@
 - `ca-certificates`
 - `tar`
 - `bash`
+- `ping` / `iputils-ping`
 - 如果要用 `tc` 整形，还需要 `iproute2`
 - 如果系统缺 locale，脚本会自动安装并生成 `en_US.UTF-8`
 
-这类基础工具没装好时，直接跑脚本或跑 `nq` 很容易报错。
+这类基础工具没装好时，直接跑脚本或做延迟检测很容易报错。
 
 ### Debian / Ubuntu
 
 ```bash
 apt update
-apt install -y curl wget ca-certificates tar xz-utils gzip coreutils util-linux bash iproute2
+apt install -y curl wget ca-certificates tar xz-utils gzip coreutils util-linux bash iputils-ping iproute2
 ```
 
 ### Rocky / Alma / CentOS / Oracle Linux
 
 ```bash
-dnf install -y curl wget tar xz gzip coreutils util-linux bash iproute
+dnf install -y curl wget tar xz gzip coreutils util-linux bash iputils iproute
 ```
 
 如果没有 `dnf`：
 
 ```bash
-yum install -y curl wget tar xz gzip coreutils util-linux bash iproute
+yum install -y curl wget tar xz gzip coreutils util-linux bash iputils iproute
 ```
 
 ### Alpine
 
 ```bash
-apk add curl wget tar xz gzip coreutils util-linux bash iproute2
+apk add curl wget tar xz gzip coreutils util-linux bash iputils iproute2
 ```
 
 ### 其他冷门系统
@@ -83,7 +88,7 @@ Debian / Ubuntu 新机器可以直接按下面这套跑，已包含 SSH 安全�
 
 ```bash
 apt update
-apt install -y curl wget ca-certificates tar xz-utils gzip coreutils util-linux bash iproute2 || true
+apt install -y curl wget ca-certificates tar xz-utils gzip coreutils util-linux bash iputils-ping iproute2 || true
 
 curl -fsSL https://raw.githubusercontent.com/byethan/vps-firstboot/main/vps-firstboot.sh -o /root/vps-firstboot.sh || \
 wget -O /root/vps-firstboot.sh https://raw.githubusercontent.com/byethan/vps-firstboot/main/vps-firstboot.sh
@@ -101,6 +106,7 @@ bash /root/vps-firstboot.sh \
 - 如果地区识别失败，默认按 `asia`
 - 如果带宽识别失败，亚洲默认按 `500M`，海外默认按 `1000M`
 - 有些 VPS 虚拟网卡会统一上报 `10000M`，不一定等于商家套餐限速；脚本会显示 `tcp_profile_source`，发现不准时手动传 `--bandwidth`
+- 默认会写入 `/etc/gai.conf` 的地址选择策略，让双栈域名优先走 IPv4；这对 3x-ui / 代理节点生成时优先选到 IPv6 的机器更友好，但不会禁用 IPv6
 
 如果想手动指定，仍然可以覆盖：
 
@@ -175,7 +181,164 @@ sudo bash vps-firstboot.sh --bandwidth 1000 --region overseas
 bash vps-firstboot.sh --dry-run
 ```
 
-脚本默认会开启系统级 Linux TCP `BBR + fq`，并写入一组按 `--region` 和 `--bandwidth` 选择的 TCP 参数。如果某台机器不想动网络队列和 TCP 拥塞控制，可以加：
+脚本默认会开启系统级 Linux TCP `BBR + fq`，只写入两条最小 TCP/sysctl 基线：
+
+```text
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+```
+
+旧版脚本写过的 `/etc/sysctl.d/99-vps-tcp-tune.conf` 会被自动改名为 `.disabled`，避免 `rmem_max`、`wmem_max`、`tcp_rmem`、`tcp_wmem`、`netdev_max_backlog` 这类激进参数继续参与 `sysctl --system`。
+
+脚本也会默认写入 `/etc/gai.conf` 的 IPv4 优先策略：
+
+```text
+precedence ::1/128 50
+precedence ::/0 40
+precedence 2002::/16 30
+precedence ::/96 20
+precedence ::ffff:0:0/96 100
+```
+
+这表示当一个域名同时有 A 和 AAAA 记录时，系统地址选择会优先 IPv4-mapped 地址。它不会关闭 IPv6；如果某台机器明确想保留系统默认双栈选择，可以加：
+
+```bash
+sudo bash vps-firstboot.sh --network-only --no-prefer-ipv4 -y
+```
+
+如果你已经知道瓶颈带宽和 RTT，可以按 BDP 写入 `tcp_rmem` / `tcp_wmem` 的最大值。公式是：
+
+```text
+BDP bytes = bottleneck_mbps * 1000000 * rtt_ms / 8000
+```
+
+例如本地瓶颈约 600Mbps、到 VPS RTT 约 170ms，先预览：
+
+```bash
+bash vps-firstboot.sh \
+  --network-only \
+  --enable-bdp-tune \
+  --bdp-bandwidth 600 \
+  --bdp-rtt 170 \
+  --dry-run
+```
+
+确认输出里的 BDP buffer 合理后再应用：
+
+```bash
+sudo bash vps-firstboot.sh \
+  --network-only \
+  --enable-bdp-tune \
+  --bdp-bandwidth 600 \
+  --bdp-rtt 170 \
+  -y
+```
+
+脚本会写入 `/etc/sysctl.d/90-vps-bbr-fq.conf`，大致类似：
+
+```text
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 12750000
+net.core.wmem_max = 12750000
+net.ipv4.tcp_rmem = 4096 87380 12750000
+net.ipv4.tcp_wmem = 4096 16384 12750000
+```
+
+如果晚高峰 `iperf3` 测出来 0 重传或低重传，可以用 `--bdp-extra-mib 1`、`--bdp-extra-mib 2` 逐步加一点余量；如果重传高或速度抖动，就去掉余量或降低 `--bdp-bandwidth`。不要一上来写 64MiB、128MiB、512MiB 这种大 buffer。
+
+测试时在 VPS 上临时启动 `iperf3` 服务端，并从你的瓶颈网络客户端测试下行单线程：
+
+```bash
+# VPS 侧，测试时临时运行
+iperf3 -s
+
+# 客户端侧
+iperf3 -c SERVER_IP -R -t 30
+```
+
+## BBRv3 内核管理
+
+脚本支持无人值守安装 BBRv3 标准版内核，并默认启用 `BBR + fq`。安装阶段不会自动重启，原系统内核也不会被删除，方便在面板或 GRUB 里回退。
+
+上游来源是 `byJoey/Actions-bbr-v3` 的 GitHub Releases。上游主脚本仍以交互菜单为主；这里不模拟菜单按键，而是直接用 Releases API 选择标准版 `.deb` 内核包安装。
+
+支持范围：
+
+- Debian 12 / Debian 13
+- Ubuntu 24.04+
+- `x86_64` / `aarch64`
+- 默认安装标准 BBRv3，不安装 `-max` 激进版
+
+先在一台测试机上跑：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/byethan/vps-firstboot/main/vps-firstboot.sh -o /root/vps-firstboot.sh || \
+wget -O /root/vps-firstboot.sh https://raw.githubusercontent.com/byethan/vps-firstboot/main/vps-firstboot.sh
+
+bash /root/vps-firstboot.sh install -y
+```
+
+安装后手动重启：
+
+```bash
+reboot
+```
+
+重启回来检查：
+
+```bash
+bash /root/vps-firstboot.sh check
+```
+
+如果要锁定某个已测试稳定的版本：
+
+```bash
+bash /root/vps-firstboot.sh install --bbrv3-version x86_64-7.1.2 --lock-bbrv3-version -y
+```
+
+之后不显式传 `--bbrv3-version` 时，会优先使用 `/etc/vps-firstboot/bbrv3-version.lock` 里的版本，避免十几台机器突然装到未经测试的新版本。
+
+如果需要回滚：
+
+```bash
+bash /root/vps-firstboot.sh rollback -y
+```
+
+回滚会恢复最近一次 sysctl 备份，删除本脚本写入的 BBR/fq 配置，并尽量移除非当前运行中的 BBRv3 内核包。脚本不会删除当前正在运行的内核；如果当前就在 BBRv3 内核里，需要先通过面板/GRUB 启动回原内核，再跑 rollback。
+
+## 批量升级
+
+十几台 VPS 不需要逐台登录，可以用本仓库的批量脚本从本地 Mac 执行。准备一个 hosts 文件：
+
+```text
+hk1 root@1.2.3.4 20022
+jp1 root@2001:db8::10 20022
+root@example.com
+```
+
+推荐流程：
+
+```bash
+# 1. 先审计所有机器
+bash vps-fleet-bbrv3.sh hosts.txt audit
+
+# 2. 先挑一台测试机单独安装，稳定后再批量
+bash vps-fleet-bbrv3.sh test-hosts.txt install
+
+# 3. 批量安装，但不重启
+bash vps-fleet-bbrv3.sh hosts.txt install
+
+# 4. 每批 2 台滚动重启，SSH 恢复并 verify 后继续
+bash vps-fleet-bbrv3.sh hosts.txt rolling-reboot --batch-size 2
+
+# 5. 最终复查
+bash vps-fleet-bbrv3.sh hosts.txt verify
+```
+
+如果有关键业务机器，建议把它们单独放在最后一个 hosts 文件里，每批 1 台滚动。
+
+如果某台机器不想动网络队列和 TCP 拥塞控制，可以加：
 
 ```bash
 sudo bash vps-firstboot.sh \
@@ -216,24 +379,7 @@ sudo BPFTUNE_REF=main BPFTUNE_SRC_DIR=/usr/local/src/bpftune \
   bash vps-firstboot.sh --network-only --enable-bpftune -y
 ```
 
-TCP/sysctl 优化包含：
-
-- `net.core.rmem_max` / `net.core.wmem_max`
-- `net.ipv4.tcp_rmem` / `net.ipv4.tcp_wmem`
-- `net.ipv4.tcp_mtu_probing = 1`
-- `net.ipv4.tcp_fastopen = 3`
-- `net.ipv4.tcp_slow_start_after_idle = 0`
-- `net.ipv4.tcp_syncookies = 1`
-- `net.ipv4.tcp_tw_reuse = 1`
-- `net.ipv4.tcp_keepalive_time = 600`
-- `net.ipv4.tcp_keepalive_intvl = 60`
-- `net.ipv4.tcp_keepalive_probes = 5`
-- `net.ipv4.tcp_max_syn_backlog`
-- `net.core.somaxconn`
-- `net.core.netdev_max_backlog`
-- `net.ipv4.ip_local_port_range = 10240 65535`
-
-这些参数不包含关闭 IPv6 这类强环境假设。如果不想改 TCP/sysctl 参数，只保留 SSH 加固，可以加：
+脚本不再写大 buffer/backlog TCP 模板，也不关闭 IPv6。如果不想改 TCP/sysctl 参数，只保留 SSH 加固，可以加：
 
 ```bash
 sudo bash vps-firstboot.sh \
@@ -241,6 +387,17 @@ sudo bash vps-firstboot.sh \
   --port <ssh-port> \
   --no-vps-sysctl \
   --public-key 'ssh-ed25519 AAAA... your-key-comment'
+```
+
+如果 `/etc/sysctl.conf` 或 `/etc/sysctl.d/99-sysctl.conf` 里也残留旧 TCP 参数，脚本只会提示，不会自动删除。建议先备份，再人工看输出：
+
+```bash
+bak=/root/sysctl-bak-$(date +%F-%H%M)
+mkdir -p "$bak"
+cp -a /etc/sysctl.conf /etc/sysctl.d "$bak"/
+echo "$bak"
+
+grep -RnsE 'default_qdisc|tcp_congestion_control|rmem_max|wmem_max|tcp_rmem|tcp_wmem|netdev_max_backlog|somaxconn|tcp_fastopen|tcp_mtu_probing|slow_start_after_idle' /etc/sysctl.conf /etc/sysctl.d
 ```
 
 如果你已经测过链路，想把出口速率主动压在上限以下，可以显式启用 `tc` 整形。比如 100M 口压到 97M，且链路 MTU 需要 1492：
@@ -280,9 +437,12 @@ ssh -p <ssh-port> root@SERVER_IP
 - `tcp_profile_source`
 - `tcp_profile_country`
 - `tcp_profile_iface`
+- `bdp_tune`
 - `bbr_available`
 - `default_qdisc`
 - `tcp_congestion_control`
+- `rmem_max`
+- `wmem_max`
 - `tcp_rmem`
 - `tcp_wmem`
 - `tcp_mtu_probing`
@@ -313,6 +473,7 @@ ssh -p <ssh-port> root@SERVER_IP
 - [ ] `usedns no`
 - [ ] `acceptenv LANG`
 - [ ] `system_locale en_US.UTF-8`
+- [ ] `/etc/gai.conf` 里有 `precedence ::ffff:0:0/96 100`
 - [ ] `default_qdisc fq`
 - [ ] `tcp_congestion_control bbr`
 - [ ] `tcp_mtu_probing 1`
@@ -327,6 +488,7 @@ ssh -p <ssh-port> root@SERVER_IP
 ss -ltnp | grep -E ':(22|<ssh-port>)\b'
 sshd -T | grep -E '^(port|passwordauthentication|permitrootlogin|allowusers|pubkeyauthentication|usedns|acceptenv)'
 cat /etc/default/locale
+grep -nE '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100' /etc/gai.conf
 sysctl net.ipv4.tcp_available_congestion_control
 sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc
 sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem
@@ -346,27 +508,40 @@ fail2ban-client status
 fail2ban-client status sshd
 ```
 
-## 4. 再跑 NQ
+## 4. 落地机大站延迟检测
 
 先确认依赖在：
 
 ```bash
 which curl
-which tar
+which wget
 which bash
+which ping
 ```
 
 再跑：
 
 ```bash
-bash <(curl -sL https://run.NodeQuality.com)
+curl -fsSL https://raw.githubusercontent.com/byethan/vps-firstboot/main/vps-speedtest.sh -o /tmp/vps-speedtest.sh || \
+wget -O /tmp/vps-speedtest.sh https://raw.githubusercontent.com/byethan/vps-firstboot/main/vps-speedtest.sh
+
+bash /tmp/vps-speedtest.sh sites
 ```
 
-如果 `nq` 报：
+默认会从当前机器依次 Ping Google、YouTube、GitHub、Apple、Microsoft、Cloudflare、OpenAI、Telegram、Netflix、TikTok、X、AWS、Steam、NodeSeek 等常用大站，输出平均延迟和丢包率。
+
+想多打几次包，或只测指定网站：
+
+```bash
+bash /tmp/vps-speedtest.sh sites --count 6 --timeout 5
+bash /tmp/vps-speedtest.sh sites github.com chatgpt.com www.youtube.com
+```
+
+如果检测报：
 
 - `curl: command not found`
-- `tar: command not found`
-- `BenchOs: No such file or directory`
+- `wget: command not found`
+- `ping: command not found`
 
 先回到“先补基础工具”这一步，不要直接硬跑。
 
@@ -382,7 +557,7 @@ bash <(curl -sL https://run.NodeQuality.com)
 
 ## 脚本改动的配置
 
-SSH 配置会写到：
+SSH 配置默认会写到：
 
 ```text
 /etc/ssh/sshd_config.d/00-login-hardening.conf
@@ -394,9 +569,8 @@ SSH 配置会写到：
 Port <your-port>
 PubkeyAuthentication yes
 PasswordAuthentication no
-KbdInteractiveAuthentication no
 ChallengeResponseAuthentication no
-PermitRootLogin prohibit-password
+PermitRootLogin without-password
 PermitEmptyPasswords no
 AllowUsers root
 UseDNS no
@@ -404,6 +578,8 @@ AcceptEnv LANG
 ```
 
 脚本会先备份 `/etc/ssh/sshd_config` 到同目录的时间戳文件。为了保证 drop-in 配置真实生效，它会注释主配置里全局范围内和登录加固冲突的 SSH 指令，例如 `Port`、`PasswordAuthentication`、`PermitRootLogin`、`AllowUsers` 等；`Match` 块内的内容不会被批量改写。旧版脚本生成的 `/etc/ssh/sshd_config.d/99-login-hardening.conf` 会被清理，避免同一组托管配置重复出现。
+
+如果服务器上的 OpenSSH 太旧，不支持 `Include` 指令，脚本会自动改用内联模式，把同一组配置写入 `/etc/ssh/sshd_config` 顶部的 `# BEGIN managed by vps-firstboot` 配置块中。重复运行脚本时会更新这段托管配置，并移除旧版脚本可能留下的 `/etc/ssh/sshd_config.d/*.conf` 引用，避免出现 `Bad configuration option: Include`。
 
 `AcceptEnv LANG` 会保留正常语言环境，但不再接受 macOS 常见的 `LC_CTYPE=UTF-8`，避免 Debian/Ubuntu 登录时出现 `invalid locale` 和 `setlocale` 警告。
 
@@ -440,39 +616,24 @@ backend = systemd
 
 `backend` 会按系统自动选择，带 `systemd` 的机器通常会写成 `systemd`，其他环境会回落到 `auto`。
 
-TCP 优化配置会写到：
+TCP 最小基线配置会写到：
 
 ```text
-/etc/sysctl.d/99-vps-tcp-tune.conf
+/etc/sysctl.d/90-vps-bbr-fq.conf
 ```
 
-亚洲 1000M profile 的内容大概是：
+默认内容大概是：
 
 ```text
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
-net.core.rmem_max = 134217728
-net.core.wmem_max = 134217728
-net.ipv4.tcp_rmem = 4096 87380 134217728
-net.ipv4.tcp_wmem = 4096 65536 134217728
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_keepalive_time = 600
-net.ipv4.tcp_keepalive_intvl = 60
-net.ipv4.tcp_keepalive_probes = 5
-net.ipv4.tcp_fin_timeout = 15
-net.ipv4.tcp_max_syn_backlog = 16384
-net.core.somaxconn = 16384
-net.core.netdev_max_backlog = 32768
-net.ipv4.ip_local_port_range = 10240 65535
 ```
 
-旧版脚本生成的这两个文件会被清理，避免 sysctl 顺序互相覆盖：
+旧版脚本生成的这些文件会被禁用或清理，避免 sysctl 顺序互相覆盖：
 
 ```text
+/etc/sysctl.d/99-vps-tcp-tune.conf
+/etc/sysctl.d/99-joeyblog.conf
 /etc/sysctl.d/98-vps-baseline.conf
 /etc/sysctl.d/99-bbr-fq.conf
 ```
