@@ -28,10 +28,15 @@ TCP_TUNE_ARGS_SEEN="no"
 TCP_TUNE_ONLY="${TCP_TUNE_ONLY:-no}"
 TUNE_BANDWIDTH="${TUNE_BANDWIDTH:-${BANDWIDTH:-auto}}"
 TUNE_REGION="${TUNE_REGION:-${REGION:-auto}}"
+TUNE_ROLE="${TUNE_ROLE:-${ROLE:-general}}"
+SMART_TCP_TUNE="${SMART_TCP_TUNE:-auto}"
 TUNE_BANDWIDTH_SOURCE="configured"
 TUNE_REGION_SOURCE="configured"
 TUNE_COUNTRY_CODE=""
 TUNE_DEFAULT_IFACE=""
+SMART_BUFFER_MB=""
+SMART_BUFFER_BYTES=""
+SMART_MEMORY_CAP_MB=""
 DRY_RUN="${DRY_RUN:-no}"
 TC_IFACE="${TC_IFACE:-}"
 TC_RATE="${TC_RATE:-}"
@@ -48,6 +53,10 @@ BBRV3_INSTALL_DIR="${BBRV3_INSTALL_DIR:-/var/cache/vps-firstboot/bbrv3}"
 BBRV3_BACKUP_ROOT="${BBRV3_BACKUP_ROOT:-/root/vps-firstboot-backups}"
 BBRV3_SELECTED_TAG=""
 BBRV3_NEEDS_REBOOT="no"
+BBRV3_BACKUP_DONE="no"
+NETWORK_BACKUP_DONE="no"
+NETWORK_BACKUP_DIR=""
+NETWORK_TUNE_APPLIED="no"
 
 usage() {
   cat <<'USAGE'
@@ -57,6 +66,7 @@ Usage:
   sudo bash vps-firstboot.sh install -y
   sudo bash vps-firstboot.sh check
   sudo bash vps-firstboot.sh rollback -y
+  sudo bash vps-firstboot.sh network-rollback -y
 
 Options:
   --user NAME           Existing SSH user to install the key for. Default: root
@@ -89,6 +99,9 @@ Options:
   --bpftune-src DIR     bpftune source checkout directory. Default: /usr/local/src/bpftune
   --network-only        Only apply network optimization; skip SSH hardening
   --tcp-tune-only       Alias of --network-only
+  --role ROLE           VPS role: general, transit, exit, or web. Default: general
+  --enable-smart-tune   Apply memory-capped region/bandwidth TCP buffers
+  --no-smart-tune       Keep minimal buffers. Default for general/web roles
   --bandwidth MBPS      TCP tuning profile bandwidth. Examples: auto, 500, 1000. Default: auto
   --region REGION       TCP tuning profile region: auto, asia, or overseas. "oversea" is accepted as overseas. Default: auto
   --dry-run             Preview TCP tuning files without applying changes
@@ -113,7 +126,8 @@ Environment variables with the same names also work:
   ENABLE_PREFER_IPV4, ENABLE_BBRV3_KERNEL,
   ENABLE_BDP_TUNE, BDP_BANDWIDTH_MBPS, BDP_RTT_MS, BDP_EXTRA_MIB,
   ENABLE_BPFTUNE, BPFTUNE_REPO, BPFTUNE_REF, BPFTUNE_SRC_DIR, TCP_TUNE_ONLY,
-  TUNE_BANDWIDTH, BANDWIDTH, TUNE_REGION, REGION, DRY_RUN, TC_IFACE, TC_RATE,
+  TUNE_BANDWIDTH, BANDWIDTH, TUNE_REGION, REGION, TUNE_ROLE, ROLE, SMART_TCP_TUNE,
+  DRY_RUN, TC_IFACE, TC_RATE,
   TC_MTU, TC_BURST, ASSUME_YES, BBRV3_REPO, BBRV3_VERSION, BBRV3_FLAVOR,
   BBRV3_LOCK_VERSION, BBRV3_LOCK_FILE, BBRV3_INSTALL_DIR, BBRV3_BACKUP_ROOT
 
@@ -123,8 +137,8 @@ What this script does:
   3. disable SSH password login
   4. keep root login key-only
   5. enable Linux TCP BBR with fq qdisc by default
-  6. keep TCP/sysctl changes minimal: only BBR + fq by default
-  7. optionally write BDP-based TCP buffer values when bandwidth and RTT are supplied
+  6. tune conservatively by VPS role; general stays at only BBR + fq by default
+  7. optionally write memory-capped smart buffers or explicit BDP-based buffers
   8. configure a UTF-8 system locale and avoid invalid SSH LC_* imports
   9. prefer IPv4 for dual-stack hostname resolution without disabling IPv6
   10. install standard BBRv3 kernel by default, without automatic reboot
@@ -133,11 +147,13 @@ What this script does:
   13. optionally configure tc egress shaping when iface and rate are supplied
   14. create a systemd service to restore fq on the default route interface
 
-BBRv3 subcommands:
+Management subcommands:
   install   Install the standard BBRv3 kernel from GitHub Releases, enable BBR + fq,
             clean legacy aggressive sysctl snippets, and do not reboot automatically.
   check     Print OS, kernel, BBR module, qdisc, congestion control, lock, and reboot state.
   rollback  Restore latest sysctl backup and remove non-running BBRv3 kernel packages when safe.
+  network-rollback
+            Restore the latest managed network configuration backup without removing kernels.
 
 Important:
   Keep the current SSH session open. Open a second terminal and test:
@@ -172,6 +188,20 @@ normalize_region() {
   case "$TUNE_REGION" in
     oversea)
       TUNE_REGION="overseas"
+      ;;
+  esac
+}
+
+normalize_role() {
+  case "$TUNE_ROLE" in
+    line|relay)
+      TUNE_ROLE="transit"
+      ;;
+    landing|proxy)
+      TUNE_ROLE="exit"
+      ;;
+    site|website)
+      TUNE_ROLE="web"
       ;;
   esac
 }
@@ -279,6 +309,91 @@ resolve_auto_profile() {
   fi
 }
 
+resolve_smart_tcp_tune() {
+  if [[ "$SMART_TCP_TUNE" == "auto" ]]; then
+    case "$TUNE_ROLE" in
+      transit|exit)
+        SMART_TCP_TUNE="yes"
+        ;;
+      *)
+        SMART_TCP_TUNE="no"
+        ;;
+    esac
+  fi
+}
+
+get_tcp_buffer_cap_mb() {
+  local mem_kb
+  mem_kb="$(awk '/MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null || true)"
+
+  if ! [[ "$mem_kb" =~ ^[0-9]+$ ]]; then
+    printf '64\n'
+  elif (( mem_kb < 524288 )); then
+    printf '16\n'
+  elif (( mem_kb < 1048576 )); then
+    printf '32\n'
+  else
+    printf '64\n'
+  fi
+
+}
+
+calculate_smart_buffer_mb() {
+  local buffer_mb
+  local cap_mb="$1"
+
+  if [[ "$TUNE_REGION" == "overseas" ]]; then
+    if (( TUNE_BANDWIDTH < 500 )); then
+      buffer_mb=16
+    elif (( TUNE_BANDWIDTH < 1000 )); then
+      buffer_mb=48
+    else
+      buffer_mb=64
+    fi
+  else
+    if (( TUNE_BANDWIDTH < 500 )); then
+      buffer_mb=8
+    elif (( TUNE_BANDWIDTH < 1000 )); then
+      buffer_mb=12
+    elif (( TUNE_BANDWIDTH < 2000 )); then
+      buffer_mb=16
+    elif (( TUNE_BANDWIDTH < 5000 )); then
+      buffer_mb=24
+    elif (( TUNE_BANDWIDTH < 10000 )); then
+      buffer_mb=28
+    else
+      buffer_mb=32
+    fi
+  fi
+
+  if (( buffer_mb > cap_mb )); then
+    buffer_mb="$cap_mb"
+  fi
+  printf '%s\n' "$buffer_mb"
+}
+
+resolve_tcp_buffer_plan() {
+  if [[ "$SMART_TCP_TUNE" != "yes" || "$ENABLE_BDP_TUNE" == "yes" ]]; then
+    return 0
+  fi
+
+  SMART_MEMORY_CAP_MB="$(get_tcp_buffer_cap_mb)"
+  SMART_BUFFER_MB="$(calculate_smart_buffer_mb "$SMART_MEMORY_CAP_MB")"
+  SMART_BUFFER_BYTES=$(( SMART_BUFFER_MB * 1024 * 1024 ))
+}
+
+tcp_tune_plan_value() {
+  if [[ "$ENABLE_BDP_TUNE" == "yes" ]]; then
+    printf 'bdp / %s bytes\n' "$BDP_BUFFER_BYTES"
+  elif [[ "$SMART_TCP_TUNE" == "yes" ]]; then
+    printf 'smart / %sMiB / memory-cap %sMiB\n' "$SMART_BUFFER_MB" "$SMART_MEMORY_CAP_MB"
+  elif [[ "$TUNE_ROLE" == "web" ]]; then
+    printf 'web-conservative / system buffers\n'
+  else
+    printf 'minimal / system buffers\n'
+  fi
+}
+
 locale_plan_value() {
   if [[ "$ENABLE_LOCALE_FIX" == "yes" ]]; then
     printf 'yes / %s\n' "$SYSTEM_LOCALE"
@@ -306,7 +421,7 @@ ipv4_preference_plan_value() {
 parse_args() {
   if [[ $# -gt 0 ]]; then
     case "$1" in
-      install|check|rollback)
+      install|check|rollback|network-rollback)
         BBRV3_ACTION="$1"
         shift
         ;;
@@ -458,6 +573,22 @@ parse_args() {
         TCP_TUNE_ARGS_SEEN="yes"
         shift
         ;;
+      --role)
+        [[ $# -ge 2 ]] || die "--role requires a value"
+        TUNE_ROLE="${2:-}"
+        TCP_TUNE_ARGS_SEEN="yes"
+        shift 2
+        ;;
+      --enable-smart-tune)
+        SMART_TCP_TUNE="yes"
+        TCP_TUNE_ARGS_SEEN="yes"
+        shift
+        ;;
+      --no-smart-tune)
+        SMART_TCP_TUNE="no"
+        TCP_TUNE_ARGS_SEEN="yes"
+        shift
+        ;;
       --bandwidth)
         [[ $# -ge 2 ]] || die "--bandwidth requires a value"
         TUNE_BANDWIDTH="${2:-}"
@@ -559,13 +690,16 @@ validate_inputs() {
   fi
 
   normalize_region
+  normalize_role
   resolve_auto_profile
+  resolve_smart_tcp_tune
 
   [[ "$COPY_ROOT_KEYS" =~ ^(yes|no)$ ]] || die "COPY_ROOT_KEYS must be yes or no"
   [[ "$ENABLE_FAIL2BAN" =~ ^(yes|no)$ ]] || die "ENABLE_FAIL2BAN must be yes or no"
   [[ "$ENABLE_BBR_FQ" =~ ^(yes|no)$ ]] || die "ENABLE_BBR_FQ must be yes or no"
   [[ "$ENABLE_VPS_SYSCTL" =~ ^(yes|no)$ ]] || die "ENABLE_VPS_SYSCTL must be yes or no"
   [[ "$ENABLE_BDP_TUNE" =~ ^(yes|no)$ ]] || die "ENABLE_BDP_TUNE must be yes or no"
+  [[ "$SMART_TCP_TUNE" =~ ^(yes|no)$ ]] || die "SMART_TCP_TUNE must be auto, yes, or no"
   [[ "$ENABLE_LOCALE_FIX" =~ ^(yes|no)$ ]] || die "ENABLE_LOCALE_FIX must be yes or no"
   [[ "$ENABLE_PREFER_IPV4" =~ ^(yes|no)$ ]] || die "ENABLE_PREFER_IPV4 must be yes or no"
   [[ "$ENABLE_BBRV3_KERNEL" =~ ^(yes|no)$ ]] || die "ENABLE_BBRV3_KERNEL must be yes or no"
@@ -575,6 +709,7 @@ validate_inputs() {
   [[ "$ASSUME_YES" =~ ^(yes|no)$ ]] || die "ASSUME_YES must be yes or no"
   [[ "$SYSTEM_LOCALE" =~ ^[A-Za-z0-9_.@-]+$ ]] || die "--system-locale contains unsupported characters"
   [[ "$TUNE_REGION" =~ ^(asia|overseas)$ ]] || die "--region must be asia or overseas"
+  [[ "$TUNE_ROLE" =~ ^(general|transit|exit|web)$ ]] || die "--role must be general, transit, exit, or web"
   [[ "$TUNE_BANDWIDTH" =~ ^[0-9]+$ ]] || die "--bandwidth must be a number in Mbps"
   (( TUNE_BANDWIDTH >= 1 && TUNE_BANDWIDTH <= 100000 )) || die "--bandwidth must be from 1 to 100000 Mbps"
   if [[ "$ENABLE_BDP_TUNE" == "yes" ]]; then
@@ -590,6 +725,7 @@ validate_inputs() {
     (( BDP_BUFFER_BYTES >= 1048576 )) || die "calculated BDP buffer is below 1 MiB; check --bdp-bandwidth and --bdp-rtt"
     (( BDP_BUFFER_BYTES <= 536870912 )) || die "calculated BDP buffer exceeds 512 MiB; check --bdp-bandwidth and --bdp-rtt"
   fi
+  resolve_tcp_buffer_plan
   [[ -n "$BPFTUNE_REPO" && "$BPFTUNE_REPO" != *[[:space:]]* ]] || die "--bpftune-repo must be a non-empty URL/path without whitespace"
   [[ "$BPFTUNE_REF" =~ ^[A-Za-z0-9._/@+-]+$ ]] || die "--bpftune-ref contains unsupported characters"
   [[ "$BPFTUNE_SRC_DIR" == /* ]] || die "--bpftune-src must be an absolute path"
@@ -865,51 +1001,14 @@ configure_sshd() {
   restart_sshd_service
 }
 
-tune_profile() {
-  case "$TUNE_REGION:$TUNE_BANDWIDTH" in
-    asia:*)
-      if (( TUNE_BANDWIDTH <= 500 )); then
-        TUNE_RMEM_MAX=67108864
-        TUNE_WMEM_MAX=67108864
-        TUNE_BACKLOG=8192
-        TUNE_NETDEV_BACKLOG=16384
-      else
-        TUNE_RMEM_MAX=134217728
-        TUNE_WMEM_MAX=134217728
-        TUNE_BACKLOG=16384
-        TUNE_NETDEV_BACKLOG=32768
-      fi
-      ;;
-    overseas:*)
-      if (( TUNE_BANDWIDTH <= 500 )); then
-        TUNE_RMEM_MAX=134217728
-        TUNE_WMEM_MAX=134217728
-        TUNE_BACKLOG=16384
-        TUNE_NETDEV_BACKLOG=32768
-      else
-        TUNE_RMEM_MAX=268435456
-        TUNE_WMEM_MAX=268435456
-        TUNE_BACKLOG=32768
-        TUNE_NETDEV_BACKLOG=65536
-      fi
-      ;;
-  esac
-
-  TUNE_TCP_RMEM="4096 87380 $TUNE_RMEM_MAX"
-  TUNE_TCP_WMEM="4096 65536 $TUNE_WMEM_MAX"
-  TUNE_KEEPALIVE_TIME=600
-  TUNE_KEEPALIVE_INTVL=60
-  TUNE_KEEPALIVE_PROBES=5
-  TUNE_LOCAL_PORT_RANGE="10240 65535"
-}
-
 print_tcp_tune_sysctl() {
-  tune_profile
   printf '# Generated by %s\n' "$SCRIPT_NAME"
   if [[ "$ENABLE_BDP_TUNE" == "yes" ]]; then
     printf '# BDP TCP buffer tuning: %s Mbps, %s ms RTT, +%s MiB headroom\n' "$BDP_BANDWIDTH_MBPS" "$BDP_RTT_MS" "$BDP_EXTRA_MIB"
+  elif [[ "$SMART_TCP_TUNE" == "yes" ]]; then
+    printf '# Smart TCP tuning: role=%s, region=%s, bandwidth=%sMbps, memory-cap=%sMiB\n' "$TUNE_ROLE" "$TUNE_REGION" "$TUNE_BANDWIDTH" "$SMART_MEMORY_CAP_MB"
   else
-    printf '# minimal TCP baseline; avoid aggressive buffer/backlog tuning\n'
+    printf '# Conservative TCP profile: role=%s; keep system-managed buffers\n' "$TUNE_ROLE"
   fi
 
   if [[ "$ENABLE_BBR_FQ" == "yes" ]]; then
@@ -922,6 +1021,29 @@ print_tcp_tune_sysctl() {
     printf 'net.core.wmem_max = %s\n' "$BDP_BUFFER_BYTES"
     printf 'net.ipv4.tcp_rmem = 4096 87380 %s\n' "$BDP_BUFFER_BYTES"
     printf 'net.ipv4.tcp_wmem = 4096 16384 %s\n' "$BDP_BUFFER_BYTES"
+  elif [[ "$SMART_TCP_TUNE" == "yes" ]]; then
+    printf 'net.core.rmem_max = %s\n' "$SMART_BUFFER_BYTES"
+    printf 'net.core.wmem_max = %s\n' "$SMART_BUFFER_BYTES"
+    printf 'net.ipv4.tcp_rmem = 4096 87380 %s\n' "$SMART_BUFFER_BYTES"
+    printf 'net.ipv4.tcp_wmem = 4096 65536 %s\n' "$SMART_BUFFER_BYTES"
+  fi
+
+  case "$TUNE_ROLE" in
+    transit|exit)
+      printf 'net.ipv4.tcp_limit_output_bytes = 4194304\n'
+      printf 'net.ipv4.tcp_slow_start_after_idle = 0\n'
+      printf 'net.ipv4.tcp_mtu_probing = 1\n'
+      ;;
+    web)
+      printf 'net.core.somaxconn = 8192\n'
+      printf 'net.ipv4.tcp_max_syn_backlog = 8192\n'
+      printf 'net.ipv4.tcp_slow_start_after_idle = 0\n'
+      printf 'net.ipv4.tcp_mtu_probing = 1\n'
+      ;;
+  esac
+
+  if [[ "$TUNE_ROLE" == "exit" ]]; then
+    printf 'net.ipv4.ip_local_port_range = 10240 65535\n'
   fi
 }
 
@@ -985,27 +1107,30 @@ apply_sysctl_setting() {
 }
 
 disable_legacy_tcp_tune_conf() {
-  local file="/etc/sysctl.d/99-vps-tcp-tune.conf"
-  local disabled="${file}.disabled"
+  local file
+  local disabled
   local stamp
 
-  if [[ ! -e "$file" ]]; then
-    return 0
-  fi
-
-  if [[ -e "$disabled" ]]; then
-    stamp="$(date +%Y%m%d%H%M%S 2>/dev/null || printf 'backup')"
-    disabled="${file}.disabled.${stamp}"
-  fi
-
-  mv "$file" "$disabled"
-  log "disabled legacy aggressive TCP tuning: $file -> $disabled"
+  stamp="$(date +%Y%m%d%H%M%S 2>/dev/null || printf 'backup')"
+  for file in \
+    /etc/sysctl.d/99-vps-tcp-tune.conf \
+    /etc/sysctl.d/99-joeyblog.conf \
+    /etc/sysctl.d/98-vps-baseline.conf \
+    /etc/sysctl.d/99-bbr-fq.conf; do
+    [[ -e "$file" ]] || continue
+    disabled="${file}.disabled"
+    if [[ -e "$disabled" ]]; then
+      disabled="${file}.disabled.${stamp}"
+    fi
+    mv "$file" "$disabled"
+    log "disabled legacy aggressive TCP tuning: $file -> $disabled"
+  done
 }
 
 warn_sysctl_network_overrides() {
   local file
   local pattern
-  pattern='default_qdisc|tcp_congestion_control|rmem_max|wmem_max|tcp_rmem|tcp_wmem|netdev_max_backlog|somaxconn|tcp_fastopen|tcp_mtu_probing|slow_start_after_idle'
+  pattern='default_qdisc|tcp_congestion_control|rmem_max|wmem_max|tcp_rmem|tcp_wmem|netdev_max_backlog|somaxconn|tcp_fastopen|tcp_mtu_probing|slow_start_after_idle|tcp_limit_output_bytes|tcp_max_syn_backlog|ip_local_port_range'
 
   for file in /etc/sysctl.conf /etc/sysctl.d/99-sysctl.conf; do
     [[ -f "$file" ]] || continue
@@ -1014,6 +1139,138 @@ warn_sysctl_network_overrides() {
       grep -nE "$pattern" "$file" | sed "s#^#[$SCRIPT_NAME]   #"
     fi
   done
+}
+
+network_backup_config() {
+  local backup_dir
+  local path
+  local relative
+  local manifest
+
+  if [[ "$NETWORK_BACKUP_DONE" == "yes" ]]; then
+    return 0
+  fi
+
+  backup_dir="${BBRV3_BACKUP_ROOT}/$(date +%Y%m%d%H%M%S)-$$-network"
+  manifest="$backup_dir/manifest.tsv"
+  install -d -m 0700 "$backup_dir/files"
+  : >"$manifest"
+
+  for path in \
+    /etc/sysctl.conf \
+    /etc/sysctl.d \
+    /etc/gai.conf \
+    /etc/default/vps-fq-restore \
+    /usr/local/sbin/vps-fq-restore \
+    /etc/systemd/system/vps-fq-restore.service \
+    /etc/default/vps-tc-shape \
+    /usr/local/sbin/vps-tc-shape \
+    /etc/systemd/system/vps-tc-shape.service; do
+    if [[ -e "$path" || -L "$path" ]]; then
+      relative="${path#/}"
+      install -d -m 0700 "$backup_dir/files/$(dirname "$relative")"
+      cp -a "$path" "$backup_dir/files/$relative"
+      printf 'present\t%s\n' "$path" >>"$manifest"
+    else
+      printf 'absent\t%s\n' "$path" >>"$manifest"
+    fi
+  done
+
+  if [[ -n "$TC_IFACE" ]] && ip link show dev "$TC_IFACE" >/dev/null 2>&1; then
+    printf '%s\t%s\n' "$TC_IFACE" "$(ip -o link show dev "$TC_IFACE" | awk '{for (i=1; i<=NF; i++) if ($i == "mtu") {print $(i+1); exit}}')" >"$backup_dir/tc-mtu.tsv"
+  fi
+
+  printf '%s\n' "$backup_dir" >/etc/vps-firstboot-last-network-backup
+  NETWORK_BACKUP_DONE="yes"
+  NETWORK_BACKUP_DIR="$backup_dir"
+  log "backed up network config to $backup_dir"
+}
+
+network_backup_path_allowed() {
+  case "$1" in
+    /etc/sysctl.conf|/etc/sysctl.d|/etc/gai.conf|\
+    /etc/default/vps-fq-restore|/usr/local/sbin/vps-fq-restore|/etc/systemd/system/vps-fq-restore.service|\
+    /etc/default/vps-tc-shape|/usr/local/sbin/vps-tc-shape|/etc/systemd/system/vps-tc-shape.service)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+latest_network_backup() {
+  local pointed
+  pointed="$(sed -n '1p' /etc/vps-firstboot-last-network-backup 2>/dev/null || true)"
+  if [[ "$pointed" == "${BBRV3_BACKUP_ROOT}/"*-network && -f "$pointed/manifest.tsv" ]]; then
+    printf '%s\n' "$pointed"
+    return 0
+  fi
+  ls -dt "${BBRV3_BACKUP_ROOT}"/*-network 2>/dev/null | head -n 1 || true
+}
+
+network_rollback() {
+  local backup_dir
+  local status
+  local path
+  local source
+  local iface
+  local mtu
+
+  [[ "$(id -u)" -eq 0 ]] || die "run as root for network rollback"
+  backup_dir="$(latest_network_backup)"
+  [[ -n "$backup_dir" && -f "$backup_dir/manifest.tsv" ]] || die "no network backup was found"
+
+  cat <<PLAN
+
+Network rollback plan:
+  backup: $backup_dir
+  restore sysctl, IPv4 preference, fq restore, and tc shaping files
+  later edits to those managed paths will be replaced by the saved versions
+  kernels and SSH configuration will not be changed
+
+PLAN
+  confirm "Proceed with network rollback?" || die "aborted"
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now vps-tc-shape.service vps-fq-restore.service >/dev/null 2>&1 || true
+  fi
+
+  while IFS=$'\t' read -r status path; do
+    [[ -n "$status" && -n "$path" ]] || continue
+    network_backup_path_allowed "$path" || die "backup contains unsupported path: $path"
+    source="$backup_dir/files/${path#/}"
+    case "$status" in
+      present)
+        [[ -e "$source" || -L "$source" ]] || die "backup is incomplete: $source"
+        rm -rf "$path"
+        install -d -m 0755 "$(dirname "$path")"
+        cp -a "$source" "$path"
+        ;;
+      absent)
+        rm -rf "$path"
+        ;;
+      *)
+        die "backup has invalid manifest status: $status"
+        ;;
+    esac
+  done <"$backup_dir/manifest.tsv"
+
+  if [[ -f "$backup_dir/tc-mtu.tsv" ]]; then
+    IFS=$'\t' read -r iface mtu <"$backup_dir/tc-mtu.tsv" || true
+    if [[ "$iface" =~ ^[A-Za-z0-9_.:-]+$ ]] && [[ "$mtu" =~ ^[0-9]+$ ]] && ip link show dev "$iface" >/dev/null 2>&1; then
+      tc qdisc del dev "$iface" root >/dev/null 2>&1 || true
+      ip link set dev "$iface" mtu "$mtu" || log "warning: failed to restore MTU $mtu on $iface"
+    fi
+  fi
+
+  sysctl --system >/dev/null 2>&1 || log "warning: some restored sysctl settings could not be applied immediately"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+    [[ -f /etc/systemd/system/vps-fq-restore.service ]] && systemctl enable --now vps-fq-restore.service >/dev/null 2>&1 || true
+    [[ -f /etc/systemd/system/vps-tc-shape.service ]] && systemctl enable --now vps-tc-shape.service >/dev/null 2>&1 || true
+  fi
+
+  log "restored network config from $backup_dir"
+  log "reboot if you need every runtime queue/sysctl state reconstructed from the restored files"
 }
 
 install_fq_restore_service() {
@@ -1090,13 +1347,12 @@ configure_tcp_tune() {
   local available
   local sysctl_file="/etc/sysctl.d/90-vps-bbr-fq.conf"
 
-  if [[ "$ENABLE_BBR_FQ" != "yes" && "$ENABLE_VPS_SYSCTL" != "yes" && "$ENABLE_BDP_TUNE" != "yes" ]]; then
+  if [[ "$ENABLE_BBR_FQ" != "yes" && "$ENABLE_VPS_SYSCTL" != "yes" && "$ENABLE_BDP_TUNE" != "yes" && "$SMART_TCP_TUNE" != "yes" && "$TUNE_ROLE" == "general" ]]; then
     disable_legacy_tcp_tune_conf
     warn_sysctl_network_overrides
+    NETWORK_TUNE_APPLIED="yes"
     return 0
   fi
-
-  tune_profile
 
   if [[ "$ENABLE_BBR_FQ" == "yes" && -x "$(command -v modprobe || true)" ]]; then
     modprobe tcp_bbr 2>/dev/null || true
@@ -1123,6 +1379,29 @@ configure_tcp_tune() {
     apply_sysctl_setting "$sysctl_file" net.core.wmem_max "$BDP_BUFFER_BYTES"
     apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_rmem "4096 87380 $BDP_BUFFER_BYTES"
     apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_wmem "4096 16384 $BDP_BUFFER_BYTES"
+  elif [[ "$SMART_TCP_TUNE" == "yes" ]]; then
+    apply_sysctl_setting "$sysctl_file" net.core.rmem_max "$SMART_BUFFER_BYTES"
+    apply_sysctl_setting "$sysctl_file" net.core.wmem_max "$SMART_BUFFER_BYTES"
+    apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_rmem "4096 87380 $SMART_BUFFER_BYTES"
+    apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_wmem "4096 65536 $SMART_BUFFER_BYTES"
+  fi
+
+  case "$TUNE_ROLE" in
+    transit|exit)
+      apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_limit_output_bytes 4194304
+      apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_slow_start_after_idle 0
+      apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_mtu_probing 1
+      ;;
+    web)
+      apply_sysctl_setting "$sysctl_file" net.core.somaxconn 8192
+      apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_max_syn_backlog 8192
+      apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_slow_start_after_idle 0
+      apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_mtu_probing 1
+      ;;
+  esac
+
+  if [[ "$TUNE_ROLE" == "exit" ]]; then
+    apply_sysctl_setting "$sysctl_file" net.ipv4.ip_local_port_range "10240 65535"
   fi
 
   if [[ "$ENABLE_VPS_SYSCTL" == "yes" ]]; then
@@ -1135,6 +1414,7 @@ configure_tcp_tune() {
 
   warn_sysctl_network_overrides
   install_fq_restore_service
+  NETWORK_TUNE_APPLIED="yes"
 }
 
 configure_tc_shaping() {
@@ -1461,35 +1741,31 @@ EOF
 
 bbrv3_backup_sysctl() {
   local backup_dir
-  backup_dir="${BBRV3_BACKUP_ROOT}/$(date +%Y%m%d%H%M%S)-bbrv3"
+  if [[ "$BBRV3_BACKUP_DONE" == "yes" ]]; then
+    return 0
+  fi
+  backup_dir="${BBRV3_BACKUP_ROOT}/$(date +%Y%m%d%H%M%S)-$$-bbrv3"
   install -d -m 0700 "$backup_dir"
   cp -a /etc/sysctl.conf "$backup_dir"/ 2>/dev/null || true
   cp -a /etc/sysctl.d "$backup_dir"/sysctl.d 2>/dev/null || true
   printf '%s\n' "$backup_dir" >/etc/vps-firstboot-last-sysctl-backup 2>/dev/null || true
+  BBRV3_BACKUP_DONE="yes"
   log "backed up sysctl config to $backup_dir"
 }
 
 bbrv3_disable_aggressive_sysctl_files() {
-  local file
-  local disabled
-  local stamp
-
-  stamp="$(date +%Y%m%d%H%M%S)"
-  for file in \
-    /etc/sysctl.d/99-vps-tcp-tune.conf \
-    /etc/sysctl.d/99-joeyblog.conf \
-    /etc/sysctl.d/98-vps-baseline.conf \
-    /etc/sysctl.d/99-bbr-fq.conf; do
-    [[ -e "$file" ]] || continue
-    disabled="${file}.disabled.${stamp}"
-    mv "$file" "$disabled"
-    log "disabled legacy network sysctl: $file -> $disabled"
-  done
+  disable_legacy_tcp_tune_conf
 }
 
 bbrv3_apply_fq_sysctl() {
+  if [[ "$NETWORK_TUNE_APPLIED" == "yes" ]]; then
+    log "keeping the TCP role/profile already applied during setup"
+    return 0
+  fi
   ENABLE_BBR_FQ="yes"
   ENABLE_BDP_TUNE="no"
+  SMART_TCP_TUNE="no"
+  TUNE_ROLE="general"
   ENABLE_VPS_SYSCTL="no"
   configure_tcp_tune
 }
@@ -1659,6 +1935,9 @@ run_bbrv3_action() {
     rollback)
       bbrv3_rollback
       ;;
+    network-rollback)
+      network_rollback
+      ;;
   esac
 }
 
@@ -1730,12 +2009,14 @@ print_tcp_tune_dry_run() {
 Dry run: TCP tuning preview only. No files will be written and no sysctl/tc changes will be applied.
 
 Profile:
+  role:             $TUNE_ROLE
   region:           $TUNE_REGION
   region source:    $TUNE_REGION_SOURCE
   bandwidth:        ${TUNE_BANDWIDTH}Mbps
   bandwidth source: $TUNE_BANDWIDTH_SOURCE
   bbr + fq:         $ENABLE_BBR_FQ
-  tcp sysctl:       $([[ "$ENABLE_BDP_TUNE" == "yes" ]] && echo "bbr/fq plus BDP buffers" || echo "minimal bbr/fq only")
+  tcp sysctl:       $(tcp_tune_plan_value)
+  smart tune:       $SMART_TCP_TUNE
   bdp tune:         $(bdp_plan_value)
   locale fix:       $(locale_plan_value)
   ipv4 preference:  $(ipv4_preference_plan_value)
@@ -1744,6 +2025,7 @@ Profile:
   tc shaping:       ${TC_IFACE:-disabled}${TC_RATE:+ @ $TC_RATE}
 
 Would disable legacy /etc/sysctl.d/99-vps-tcp-tune.conf if present.
+Would create a timestamped network backup before applying changes.
 Would write /etc/sysctl.d/90-vps-bbr-fq.conf:
 DRYRUN
   print_tcp_tune_sysctl
@@ -1801,7 +2083,9 @@ Plan:
   ssh port:        $SSH_PORT
   copy root keys:  $COPY_ROOT_KEYS
   bbr + fq:         $ENABLE_BBR_FQ
-  tcp sysctl:       $([[ "$ENABLE_BDP_TUNE" == "yes" ]] && echo "bbr/fq plus BDP buffers" || echo "minimal bbr/fq only")
+  tcp role:         $TUNE_ROLE
+  tcp sysctl:       $(tcp_tune_plan_value)
+  smart tune:       $SMART_TCP_TUNE
   bdp tune:         $(bdp_plan_value)
   locale fix:       $(locale_plan_value)
   ipv4 preference:  $(ipv4_preference_plan_value)
@@ -1821,7 +2105,9 @@ PLAN
 Plan:
   ssh hardening:    no
   bbr + fq:         $ENABLE_BBR_FQ
-  tcp sysctl:       $([[ "$ENABLE_BDP_TUNE" == "yes" ]] && echo "bbr/fq plus BDP buffers" || echo "minimal bbr/fq only")
+  tcp role:         $TUNE_ROLE
+  tcp sysctl:       $(tcp_tune_plan_value)
+  smart tune:       $SMART_TCP_TUNE
   bdp tune:         $(bdp_plan_value)
   locale fix:       $(locale_plan_value)
   ipv4 preference:  $(ipv4_preference_plan_value)
@@ -1861,6 +2147,8 @@ show_verification_status() {
   printf 'system_locale: %s\n' "$(awk -F= '/^LANG=/ {gsub(/"/, "", $2); print $2; found=1} END{if(!found) print "unknown"}' /etc/default/locale 2>/dev/null || echo unknown)"
   printf 'locale_check_skip: %s\n' "$([[ -e /var/lib/cloud/instance/locale-check.skip ]] && echo yes || echo no)"
   printf 'tcp_profile: %s/%sMbps\n' "$TUNE_REGION" "$TUNE_BANDWIDTH"
+  printf 'tcp_role: %s\n' "$TUNE_ROLE"
+  printf 'tcp_tune_mode: %s\n' "$(tcp_tune_plan_value)"
   printf 'tcp_profile_source: %s/%s\n' "$TUNE_REGION_SOURCE" "$TUNE_BANDWIDTH_SOURCE"
   printf 'tcp_profile_country: %s\n' "${TUNE_COUNTRY_CODE:-unknown}"
   printf 'tcp_profile_iface: %s\n' "${TUNE_DEFAULT_IFACE:-unknown}"
@@ -1873,6 +2161,12 @@ show_verification_status() {
   printf 'wmem_max: %s\n' "$(sysctl -n net.core.wmem_max 2>/dev/null || echo unknown)"
   printf 'tcp_rmem: %s\n' "$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || echo unknown)"
   printf 'tcp_wmem: %s\n' "$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || echo unknown)"
+  printf 'tcp_limit_output_bytes: %s\n' "$(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null || echo unknown)"
+  printf 'tcp_slow_start_after_idle: %s\n' "$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo unknown)"
+  printf 'tcp_mtu_probing: %s\n' "$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo unknown)"
+  printf 'somaxconn: %s\n' "$(sysctl -n net.core.somaxconn 2>/dev/null || echo unknown)"
+  printf 'tcp_max_syn_backlog: %s\n' "$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo unknown)"
+  printf 'network_backup: %s\n' "${NETWORK_BACKUP_DIR:-none-this-run}"
   printf 'legacy_tcp_tune_conf: %s\n' "$([[ -e /etc/sysctl.d/99-vps-tcp-tune.conf ]] && echo present || echo disabled)"
   printf 'fq_restore_service: %s\n' "$(systemctl is-enabled vps-fq-restore.service 2>/dev/null || echo unavailable)"
 
@@ -1931,6 +2225,17 @@ The current TCP/network verification status is shown above.
 DONE
   fi
 
+  if [[ -n "$NETWORK_BACKUP_DIR" ]]; then
+    cat <<ROLLBACK_DONE
+
+Network rollback point:
+  $NETWORK_BACKUP_DIR
+
+To restore it without changing the kernel or SSH configuration:
+  bash /root/vps-firstboot.sh network-rollback -y
+ROLLBACK_DONE
+  fi
+
   if [[ "$BBRV3_NEEDS_REBOOT" == "yes" ]]; then
     cat <<BBRV3_DONE
 
@@ -1984,6 +2289,11 @@ main() {
   if ssh_hardening_enabled; then
     install_authorized_keys
     configure_sshd
+  fi
+
+  network_backup_config
+  if [[ "$ENABLE_BBRV3_KERNEL" == "yes" ]]; then
+    bbrv3_backup_sysctl
   fi
 
   configure_locale

@@ -16,10 +16,13 @@
 - 修复 Debian/Ubuntu 上常见的 SSH 登录 locale 警告
 - 默认配置双栈域名优先 IPv4，不关闭 IPv6
 - 默认开启 Linux TCP `BBR + fq`
+- 支持 `general` / `transit` / `exit` / `web` 四种用途档位
+- 线路机和落地机可按地区、带宽与机器内存自动选择 TCP buffer
 - 支持 `install` / `check` / `rollback` 无人值守管理 BBRv3 标准版内核
 - 普通一键初始化默认也会安装 BBRv3 标准版内核，但不会自动重启
 - 支持锁定 BBRv3 内核版本，适合多台 VPS 分批升级
 - 默认只写入最小 TCP/sysctl 基线：`net.core.default_qdisc=fq` 和 `net.ipv4.tcp_congestion_control=bbr`
+- 每次应用网络配置前自动备份，可用 `network-rollback` 单独回退网络而不动 SSH 和内核
 - 可选安装并启用 `bpftune`，让 Linux 通过 BPF 做长期自动调优
 - 可选配置 `tc` 出口整形，适合已测出链路上限的机器
 - 写入 `/etc/sysctl.d/90-vps-bbr-fq.conf`
@@ -132,11 +135,51 @@ bash /root/vps-firstboot.sh check
 ```bash
 bash /root/vps-firstboot.sh \
   --port 22928 \
+  --role transit \
   --bandwidth 625 \
   --region asia \
   --public-key 'ssh-ed25519 AAAA... your-key-comment' \
   -y
 ```
+
+`--role` 决定机器用途，地区和带宽决定是否需要 TCP buffer 以及 buffer 档位：
+
+| 用途 | 参数 | 默认策略 |
+| --- | --- | --- |
+| 普通初始化 | `--role general` | 只写 BBR + FQ，保留系统自动 buffer |
+| 线路机/中转机 | `--role transit` | 自动启用内存受限的智能 buffer，并设置 4MiB 输出节奏、MTU 探测和关闭空闲慢启动 |
+| 落地鸡/代理出口 | `--role exit` | 使用线路机策略，另外扩大本地临时端口范围 |
+| 建站鸡 | `--role web` | 保留系统 buffer，只增加保守的监听队列、SYN 队列、MTU 探测和空闲连接优化 |
+
+脚本不会尝试根据进程自动猜机器用途。新装空机器没有足够信息可靠区分线路机、落地鸡和建站鸡，因此默认使用最安全的 `general`，用途由一键命令显式指定。
+
+线路机和落地机默认启用智能 buffer，档位参考 [byJoey/Actions-bbr-v3](https://github.com/byJoey/Actions-bbr-v3#bbr-v3-智能带宽优化) 的智能带宽策略：
+
+| 套餐带宽 | 亚太 | 欧美 |
+| --- | ---: | ---: |
+| `<500M` | 8MiB | 16MiB |
+| `500-999M` | 12MiB | 48MiB |
+| `1000-1999M` | 16MiB | 64MiB |
+| `2000-4999M` | 24MiB | 64MiB |
+| `5000-9999M` | 28MiB | 64MiB |
+| `>=10000M` | 32MiB | 64MiB |
+
+机器内存不足时还会限制上限：小于 512MiB 最多 16MiB，512MiB 到 1GiB 最多 32MiB，1GiB 以上最多 64MiB。可以用 `--no-smart-tune` 禁用自动 buffer，或用 `--enable-smart-tune` 在其他用途上显式启用。
+
+常用完整命令：
+
+```bash
+# 亚太线路机，例如香港/日本 625M
+bash /root/vps-firstboot.sh --port 22928 --role transit --region asia --bandwidth 625 --public-key 'ssh-ed25519 AAAA... your-key-comment' -y
+
+# 欧美落地鸡，1G
+bash /root/vps-firstboot.sh --port 22928 --role exit --region overseas --bandwidth 1000 --public-key 'ssh-ed25519 AAAA... your-key-comment' -y
+
+# 建站鸡，地区和带宽可继续自动识别
+bash /root/vps-firstboot.sh --port 22928 --role web --region auto --bandwidth auto --public-key 'ssh-ed25519 AAAA... your-key-comment' -y
+```
+
+公网 IP 归属地与实际机房不一致时必须手动指定物理线路。例如澳洲 IP 实际部署在香港，应使用 `--region asia`。网卡上报的 `10000M` 也可能只是虚拟端口速度，套餐只有 100M/500M 时应手动填写真实套餐带宽。
 
 通用写法是先确认你本地有 SSH 公钥：
 
@@ -186,21 +229,24 @@ sudo bash vps-firstboot.sh \
 网络优化可以单独跑，也可以和 SSH 加固一起跑。线路建议：
 
 ```bash
-# 自动选择地区和带宽
-sudo bash vps-firstboot.sh --network-only
+# 通用机器：自动选择地区和带宽，只保留 BBR + FQ
+sudo bash vps-firstboot.sh --network-only --role general
 
-# 手动指定亚洲线路：港 / 日 / 韩 / 新加坡
-sudo bash vps-firstboot.sh --bandwidth 500 --region asia
-sudo bash vps-firstboot.sh --bandwidth 1000 --region asia
+# 亚洲线路机：港 / 日 / 韩 / 新加坡
+sudo bash vps-firstboot.sh --network-only --role transit --bandwidth 500 --region asia
+sudo bash vps-firstboot.sh --network-only --role transit --bandwidth 1000 --region asia
 
-# 手动指定美国 / 欧洲线路
-sudo bash vps-firstboot.sh --bandwidth 1000 --region overseas
+# 美国 / 欧洲落地鸡
+sudo bash vps-firstboot.sh --network-only --role exit --bandwidth 1000 --region overseas
+
+# 建站鸡
+sudo bash vps-firstboot.sh --network-only --role web --bandwidth auto --region auto
 
 # 只预览配置，不应用
 bash vps-firstboot.sh --dry-run
 ```
 
-脚本默认会开启系统级 Linux TCP `BBR + fq`，只写入两条最小 TCP/sysctl 基线：
+脚本默认的 `general` 用途会开启系统级 Linux TCP `BBR + fq`，只写入两条最小 TCP/sysctl 基线：
 
 ```text
 net.core.default_qdisc = fq
@@ -265,6 +311,22 @@ net.ipv4.tcp_wmem = 4096 16384 12750000
 ```
 
 如果晚高峰 `iperf3` 测出来 0 重传或低重传，可以用 `--bdp-extra-mib 1`、`--bdp-extra-mib 2` 逐步加一点余量；如果重传高或速度抖动，就去掉余量或降低 `--bdp-bandwidth`。不要一上来写 64MiB、128MiB、512MiB 这种大 buffer。
+
+手动 BDP 的优先级高于智能带宽档位。也就是说，线路机或落地机同时传入 `--bdp-bandwidth` 和 `--bdp-rtt` 时，脚本使用真实 BDP 结果，不再写智能档位的 buffer；用途对应的 MTU 探测、输出节奏等保守参数仍然保留。
+
+每次正式应用前，脚本会把它管理的 sysctl、`/etc/gai.conf`、FQ 恢复服务和 `tc` 整形文件备份到：
+
+```text
+/root/vps-firstboot-backups/<时间>-network
+```
+
+如果新参数效果不理想，可以只回退网络配置，不动 SSH 端口、SSH key 和内核：
+
+```bash
+bash /root/vps-firstboot.sh network-rollback -y
+```
+
+该命令恢复最近一次网络备份。它会覆盖这些受管路径在备份后发生的修改，因此业务机器仍建议先使用 `--dry-run`，并从一台测试机开始。若运行态队列没有完全恢复，重启一次即可按回退后的持久配置重新加载。
 
 测试时在 VPS 上临时启动 `iperf3` 服务端，并从你的瓶颈网络客户端测试下行单线程：
 
@@ -398,13 +460,15 @@ sudo BPFTUNE_REF=main BPFTUNE_SRC_DIR=/usr/local/src/bpftune \
   bash vps-firstboot.sh --network-only --enable-bpftune -y
 ```
 
-脚本不再写大 buffer/backlog TCP 模板，也不关闭 IPv6。如果不想改 TCP/sysctl 参数，只保留 SSH 加固，可以加：
+脚本不会写 128MiB、256MiB 这类无内存保护的大 buffer/backlog 模板，也不关闭 IPv6。如果不想配置 BBR/FQ 和用途调优，只保留 SSH 加固，可以使用 `general` 并同时关闭 BBR/FQ 和智能 buffer：
 
 ```bash
 sudo bash vps-firstboot.sh \
   --user <user> \
   --port <ssh-port> \
-  --no-vps-sysctl \
+  --role general \
+  --no-bbr-fq \
+  --no-smart-tune \
   --public-key 'ssh-ed25519 AAAA... your-key-comment'
 ```
 
