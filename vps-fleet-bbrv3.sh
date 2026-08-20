@@ -3,8 +3,9 @@ set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
 RAW_FIRSTBOOT_URL="${RAW_FIRSTBOOT_URL:-https://raw.githubusercontent.com/byethan/vps-firstboot/main/vps-firstboot.sh}"
-DEFAULT_PORT="${SSH_PORT:-20022}"
+DEFAULT_PORT="${SSH_PORT:-22}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
+SHOW_SENSITIVE="${SHOW_SENSITIVE:-no}"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=2)
 
 usage() {
@@ -21,14 +22,18 @@ Hosts file formats:
   name user@host port
 
 Examples:
-  hk1 root@1.2.3.4 20022
-  jp1 root@2001:db8::10 20022
-  root@example.com
+  node-a root@<HOST_A> <SSH_PORT>
+  node-b root@<HOST_B> <SSH_PORT>
+  root@<HOST_USING_DEFAULT_PORT>
 
 Environment:
   RAW_FIRSTBOOT_URL   URL of vps-firstboot.sh
-  SSH_PORT            Default SSH port. Default: 20022
+  SSH_PORT            Default SSH port. Default: 22
   BATCH_SIZE          rolling-reboot batch size. Default: 2
+  SHOW_SENSITIVE      Set to yes to print SSH targets. Default: no
+
+Options:
+  --show-sensitive    Print SSH target and port in logs
 USAGE
 }
 
@@ -50,7 +55,7 @@ parse_host_line() {
   [[ "$first" == \#* ]] && return 1
 
   if [[ "$first" == *@* ]]; then
-    HOST_NAME="$first"
+    HOST_NAME="unnamed-host"
     SSH_TARGET="$first"
     SSH_PORT_VALUE="${second:-$DEFAULT_PORT}"
   else
@@ -60,8 +65,17 @@ parse_host_line() {
   fi
 
   [[ -n "$SSH_TARGET" ]] || return 1
+  [[ "$SSH_TARGET" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9._:%-]+$ ]] || die "invalid SSH target syntax for $HOST_NAME"
   [[ "$SSH_PORT_VALUE" =~ ^[0-9]+$ ]] || die "invalid SSH port for $HOST_NAME: $SSH_PORT_VALUE"
   return 0
+}
+
+host_log_label() {
+  if [[ "$SHOW_SENSITIVE" == "yes" ]]; then
+    printf '%s (%s:%s)\n' "$HOST_NAME" "$SSH_TARGET" "$SSH_PORT_VALUE"
+  else
+    printf '%s\n' "$HOST_NAME"
+  fi
 }
 
 remote_ssh() {
@@ -85,17 +99,17 @@ for_each_host() {
 }
 
 do_audit_host() {
-  log "audit $HOST_NAME ($SSH_TARGET:$SSH_PORT_VALUE)"
+  log "audit $(host_log_label)"
   remote_ssh 'uname -a; cat /etc/os-release | sed -n "1,6p"; sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc 2>/dev/null || true; modinfo tcp_bbr 2>/dev/null | grep "^version:" || true'
 }
 
 do_install_host() {
-  log "install BBRv3 on $HOST_NAME ($SSH_TARGET:$SSH_PORT_VALUE)"
+  log "install BBRv3 on $(host_log_label)"
   remote_firstboot install
 }
 
 do_verify_host() {
-  log "verify $HOST_NAME ($SSH_TARGET:$SSH_PORT_VALUE)"
+  log "verify $(host_log_label)"
   remote_firstboot check
 }
 
@@ -188,6 +202,10 @@ main() {
         BATCH_SIZE="$2"
         shift 2
         ;;
+      --show-sensitive)
+        SHOW_SENSITIVE="yes"
+        shift
+        ;;
       -h|--help)
         usage
         exit 0
@@ -199,6 +217,8 @@ main() {
   done
 
   [[ "$BATCH_SIZE" =~ ^[0-9]+$ && "$BATCH_SIZE" -ge 1 ]] || die "batch size must be >= 1"
+  [[ "$SHOW_SENSITIVE" =~ ^(yes|no)$ ]] || die "SHOW_SENSITIVE must be yes or no"
+  [[ "$RAW_FIRSTBOOT_URL" == https://* && "$RAW_FIRSTBOOT_URL" != *"'"* && "$RAW_FIRSTBOOT_URL" != *[[:space:]]* ]] || die "RAW_FIRSTBOOT_URL must be an HTTPS URL without quotes or whitespace"
 
   case "$action" in
     audit)

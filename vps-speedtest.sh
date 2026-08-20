@@ -9,6 +9,7 @@ PARALLEL="${IPERF_PARALLEL:-4}"
 DURATION="${IPERF_DURATION:-30}"
 SITE_PING_COUNT="${SITE_PING_COUNT:-4}"
 SITE_PING_TIMEOUT="${SITE_PING_TIMEOUT:-3}"
+SHOW_SENSITIVE="${SHOW_SENSITIVE:-no}"
 SERVER_HOST=""
 SITE_TARGETS=()
 DEFAULT_SITE_TARGETS=(
@@ -41,12 +42,16 @@ usage() {
   cat <<'USAGE'
 Usage:
   bash vps-speedtest.sh server [--port 5201]
+  bash vps-speedtest.sh single <vps-ip-or-domain> [--port 5201] [-t 30]
   bash vps-speedtest.sh client <vps-ip-or-domain> [--port 5201] [-P 4] [-t 30]
+  bash vps-speedtest.sh compare <vps-ip-or-domain> [--port 5201] [-P 4] [-t 30]
   bash vps-speedtest.sh sites [--count 4] [--timeout 3] [host...]
 
 Modes:
   server    Run an iperf3 server on the VPS.
-  client    Run home-to-VPS upload/download tests from your local machine.
+  single    Run privacy-safe upload/download tests with exactly one TCP stream.
+  client    Run upload/download tests with the configured stream count.
+  compare   Compare one TCP stream with the configured multi-stream count.
   sites     Test latency from the current machine to major websites.
 
 Examples:
@@ -54,14 +59,19 @@ Examples:
   bash vps-speedtest.sh server --port 5201
 
   # At home:
-  bash vps-speedtest.sh client 1.2.3.4 --port 5201 -P 4 -t 30
+  bash vps-speedtest.sh single vps.example.net --port 5201 -t 30
+  bash vps-speedtest.sh compare vps.example.net --port 5201 -P 4 -t 30
 
   # On a landing VPS:
   bash vps-speedtest.sh sites
   bash vps-speedtest.sh sites --count 6 github.com chatgpt.com
 
+Privacy:
+  --show-sensitive prints full iperf/ping/route diagnostics, including endpoints.
+
 Environment variables:
-  IPERF_PORT, IPERF_PARALLEL, IPERF_DURATION, SITE_PING_COUNT, SITE_PING_TIMEOUT
+  IPERF_PORT, IPERF_PARALLEL, IPERF_DURATION, SITE_PING_COUNT, SITE_PING_TIMEOUT,
+  SHOW_SENSITIVE
 USAGE
 }
 
@@ -120,6 +130,10 @@ parse_common_args() {
         DURATION="$2"
         shift 2
         ;;
+      --show-sensitive)
+        SHOW_SENSITIVE="yes"
+        shift
+        ;;
       -h|--help)
         usage
         exit 0
@@ -134,8 +148,13 @@ parse_common_args() {
 parse_client_args() {
   [[ $# -ge 1 ]] || die "client mode requires <vps-ip-or-domain>"
   SERVER_HOST="$1"
+  [[ "$SERVER_HOST" =~ ^[A-Za-z0-9._:%-]+$ ]] || die "target contains unsupported characters"
   shift
   parse_common_args "$@"
+  [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1 && PORT <= 65535 )) || die "port must be from 1 to 65535"
+  [[ "$PARALLEL" =~ ^[0-9]+$ ]] && (( PARALLEL >= 1 && PARALLEL <= 64 )) || die "parallel streams must be from 1 to 64"
+  [[ "$DURATION" =~ ^[0-9]+$ ]] && (( DURATION >= 1 && DURATION <= 3600 )) || die "duration must be from 1 to 3600 seconds"
+  [[ "$SHOW_SENSITIVE" =~ ^(yes|no)$ ]] || die "SHOW_SENSITIVE must be yes or no"
 }
 
 parse_sites_args() {
@@ -152,6 +171,10 @@ parse_sites_args() {
         [[ $# -ge 2 ]] || die "$1 requires a value"
         SITE_PING_TIMEOUT="$2"
         shift 2
+        ;;
+      --show-sensitive)
+        SHOW_SENSITIVE="yes"
+        shift
         ;;
       -h|--help)
         usage
@@ -178,6 +201,7 @@ parse_sites_args() {
   [[ "$SITE_PING_TIMEOUT" =~ ^[0-9]+$ ]] || die "--timeout must be a positive integer"
   (( SITE_PING_COUNT >= 1 && SITE_PING_COUNT <= 20 )) || die "--count must be from 1 to 20"
   (( SITE_PING_TIMEOUT >= 1 && SITE_PING_TIMEOUT <= 30 )) || die "--timeout must be from 1 to 30 seconds"
+  [[ "$SHOW_SENSITIVE" =~ ^(yes|no)$ ]] || die "SHOW_SENSITIVE must be yes or no"
 
   if [[ ${#SITE_TARGETS[@]} -eq 0 ]]; then
     SITE_TARGETS=("${DEFAULT_SITE_TARGETS[@]}")
@@ -208,15 +232,92 @@ run_server() {
 }
 
 run_latency_checks() {
-  log "latency check: ping ${SERVER_HOST}"
-  ping -c 10 "$SERVER_HOST" || true
+  local ping_output
+  log "latency check: ping $([[ "$SHOW_SENSITIVE" == "yes" ]] && printf '%s' "$SERVER_HOST" || printf '[target hidden]')"
+  if [[ "$SHOW_SENSITIVE" == "yes" ]]; then
+    ping -c 10 "$SERVER_HOST" || true
+  else
+    ping_output="$(LC_ALL=C ping -c 10 "$SERVER_HOST" 2>&1 || true)"
+    printf '%s\n' "$ping_output" | sed -n '/packet loss/p;/min\/avg/p;/round-trip/p'
+  fi
 
-  if have_cmd mtr; then
+  if have_cmd mtr && [[ "$SHOW_SENSITIVE" == "yes" ]]; then
     log "route check: mtr ${SERVER_HOST}"
     mtr -rwzc 50 "$SERVER_HOST" || true
+  elif have_cmd mtr; then
+    log "route details hidden; rerun with --show-sensitive if mtr diagnostics are needed"
   else
     log "mtr not found; skipping route loss/jitter check"
   fi
+}
+
+iperf_json_number() {
+  local json="$1"
+  local section="$2"
+  local key="$3"
+  printf '%s\n' "$json" | awk -v section="\"$section\"" -v key="\"$key\"" '
+    index($0, section) { active=1; next }
+    active && index($0, key) {
+      line=$0
+      sub(/^.*:[[:space:]]*/, "", line)
+      sub(/[,[:space:]].*$/, "", line)
+      print line
+      exit
+    }
+  '
+}
+
+run_iperf_direction() {
+  local direction="$1"
+  local streams="$2"
+  local label
+  local output
+  local rc
+  local bps
+  local retransmits
+
+  if [[ "$direction" == "download" ]]; then
+    label="VPS -> client download"
+  else
+    label="client -> VPS upload"
+  fi
+
+  log "testing $label: $streams stream(s), ${DURATION}s, target $([[ "$SHOW_SENSITIVE" == "yes" ]] && printf '%s:%s' "$SERVER_HOST" "$PORT" || printf '[hidden]')"
+  if [[ "$SHOW_SENSITIVE" == "yes" ]]; then
+    if [[ "$direction" == "download" ]]; then
+      iperf3 -c "$SERVER_HOST" -p "$PORT" -P "$streams" -t "$DURATION" -R
+    else
+      iperf3 -c "$SERVER_HOST" -p "$PORT" -P "$streams" -t "$DURATION"
+    fi
+    return
+  fi
+
+  set +e
+  if [[ "$direction" == "download" ]]; then
+    output="$(iperf3 -c "$SERVER_HOST" -p "$PORT" -P "$streams" -t "$DURATION" -R --json 2>/dev/null)"
+  else
+    output="$(iperf3 -c "$SERVER_HOST" -p "$PORT" -P "$streams" -t "$DURATION" --json 2>/dev/null)"
+  fi
+  rc=$?
+  set -e
+  if (( rc != 0 )); then
+    log "ERROR: iperf3 test failed; rerun with --show-sensitive for endpoint/error details"
+    return "$rc"
+  fi
+
+  bps="$(iperf_json_number "$output" sum_received bits_per_second)"
+  retransmits="$(iperf_json_number "$output" sum_sent retransmits)"
+  [[ "$bps" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "iperf3 returned no usable throughput summary"
+  [[ "$retransmits" =~ ^[0-9]+$ ]] || retransmits="n/a"
+  awk -v label="$label" -v streams="$streams" -v bps="$bps" -v retrans="$retransmits" \
+    'BEGIN {printf "%s: %.2f Mbps, streams=%s, retransmits=%s\n", label, bps/1000000, streams, retrans}'
+}
+
+run_client_profile() {
+  local streams="$1"
+  run_iperf_direction upload "$streams"
+  printf '\n'
+  run_iperf_direction download "$streams"
 }
 
 run_client() {
@@ -224,13 +325,29 @@ run_client() {
   parse_client_args "$@"
   install_iperf3
 
-  log "testing home -> VPS upload: ${SERVER_HOST}:${PORT}, ${PARALLEL} streams, ${DURATION}s"
-  iperf3 -c "$SERVER_HOST" -p "$PORT" -P "$PARALLEL" -t "$DURATION"
-
+  run_client_profile "$PARALLEL"
   printf '\n'
-  log "testing VPS -> home download: ${SERVER_HOST}:${PORT}, ${PARALLEL} streams, ${DURATION}s"
-  iperf3 -c "$SERVER_HOST" -p "$PORT" -P "$PARALLEL" -t "$DURATION" -R
+  run_latency_checks
+}
 
+run_single() {
+  shift
+  parse_client_args "$@"
+  install_iperf3
+  run_client_profile 1
+  printf '\n'
+  run_latency_checks
+}
+
+run_compare() {
+  shift
+  parse_client_args "$@"
+  install_iperf3
+  log "single-stream baseline"
+  run_client_profile 1
+  printf '\n'
+  log "multi-stream comparison"
+  run_client_profile "$PARALLEL"
   printf '\n'
   run_latency_checks
 }
@@ -245,6 +362,13 @@ ping_site() {
   local stats
   local deadline
   local -a ping_cmd
+  local display_host
+
+  if [[ "$SHOW_SENSITIVE" == "yes" ]]; then
+    display_host="$host"
+  else
+    display_host="[hidden]"
+  fi
 
   deadline=$(( SITE_PING_COUNT * SITE_PING_TIMEOUT + 3 ))
 
@@ -293,9 +417,9 @@ ping_site() {
   fi
 
   if [[ "$rc" -eq 0 && -n "$avg" ]]; then
-    printf '%-12s %-32s %10s %10s\n' "$label" "$host" "${avg}ms" "$loss"
+    printf '%-12s %-32s %10s %10s\n' "$label" "$display_host" "${avg}ms" "$loss"
   else
-    printf '%-12s %-32s %10s %10s\n' "$label" "$host" "failed" "$loss"
+    printf '%-12s %-32s %10s %10s\n' "$label" "$display_host" "failed" "$loss"
   fi
 }
 
@@ -322,8 +446,14 @@ case "$MODE" in
   server)
     run_server "$@"
     ;;
+  single)
+    run_single "$@"
+    ;;
   client)
     run_client "$@"
+    ;;
+  compare)
+    run_compare "$@"
     ;;
   sites)
     run_sites "$@"
