@@ -636,4 +636,65 @@ new_box exit-role-low-port
 expect_ok network --role exit --region overseas --bandwidth 1000 --yes
 assert_lacks "$BOX/etc/sysctl.d/90-vps-bbr-fq.conf" "ip_local_reserved_ports"
 
+# ---------------------------- moving an existing machine there and back
+run_installed() {
+  local status=0
+  env -i HOME="$BOX/root" PATH="$BOX/bin:$BOX/usr/local/sbin:$REAL_PATH" SSH_CONNECTION="${CONNECTION:-}" \
+    vps-firstboot "$@" >"$OUT" 2>&1 </dev/null || status=$?
+  STATUS="$status"
+}
+
+installed_ok() {
+  run_installed "$@"
+  [[ "$STATUS" == "0" ]] || fail "wanted success, got exit $STATUS from: $*"
+  ok
+}
+
+installed_die() {
+  run_installed "$@"
+  [[ "$STATUS" != "0" ]] || fail "wanted failure, got success from: $*"
+  ok
+}
+
+new_box round-trip-from-installed-copy 20022
+printf '%s\n' "$NEW_KEY" >"$BOX/root/.ssh/authorized_keys"
+cp "$BOX/root/.ssh/authorized_keys" "$BOX/state/keys.before"
+expect_ok security --port 20022 --no-system-update --yes
+assert_listening "20022"
+
+CONNECTION="198.51.100.7 50000 203.0.113.9 20022"
+installed_ok confirm-ssh
+assert_has "$OUT" "nothing to do"
+
+installed_ok security --port 20023 --no-system-update --yes
+assert_listening "20022 20023"
+assert_has "$OUT" "ssh_temporary_ports: 20022"
+assert_lacks "$BOX/state/calls" "full-upgrade"
+
+installed_die confirm-ssh
+assert_has "$OUT" "came in through temporary port 20022"
+assert_listening "20022 20023"
+
+CONNECTION="198.51.100.7 50000 203.0.113.9 20023"
+installed_ok confirm-ssh
+assert_has "$OUT" "closed temporary SSH ports: 20022"
+assert_listening "20023"
+
+installed_ok security --port 20022 --no-system-update --yes
+assert_listening "20022 20023"
+assert_has "$OUT" "ssh_temporary_ports: 20023"
+
+installed_die confirm-ssh
+assert_has "$OUT" "came in through temporary port 20023"
+
+CONNECTION="198.51.100.7 50000 203.0.113.9 20022"
+installed_ok confirm-ssh
+assert_listening "20022"
+installed_ok check
+assert_has "$OUT" "ssh_ports: 20022"
+assert_has "$OUT" "ssh_temporary_ports: none"
+cmp -s "$BOX/root/.ssh/authorized_keys" "$BOX/state/keys.before" || fail "authorized_keys changed"
+ok
+CONNECTION=""
+
 printf 'vps-firstboot sandbox tests passed (%s checks)\n' "$CHECKS"

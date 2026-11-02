@@ -2573,7 +2573,7 @@ install_self() {
     log "warning: this run came from a pipe, so $SELF_PATH was not installed; save the script to a file to use confirm-ssh"
     return 0
   fi
-  [[ "$source" != "$SELF_PATH" ]] || return 0
+  [[ ! "$source" -ef "$SELF_PATH" ]] || return 0
   install -d -m 0755 "$(dirname "$SELF_PATH")"
   install -m 0755 "$source" "$SELF_PATH"
 }
