@@ -62,6 +62,12 @@ for removed in --enable-bbrv3-kernel --bbrv3-max --lock-bbrv3-version; do
   assert_contains "$TEST_TMP/removed" "uses BBR from the distribution kernel"
 done
 
+if bash "$SCRIPT" confirm-ssh >"$TEST_TMP/removed" 2>&1; then
+  printf 'confirm-ssh unexpectedly succeeded\n' >&2
+  exit 1
+fi
+assert_contains "$TEST_TMP/removed" "unknown option: confirm-ssh"
+
 for removed in install rollback; do
   if bash "$SCRIPT" "$removed" -y >"$TEST_TMP/removed" 2>&1; then
     printf '%s unexpectedly succeeded\n' "$removed" >&2
@@ -93,7 +99,9 @@ assert_contains "$TEST_TMP/web" "net.core.somaxconn = 8192"
 assert_contains "$TEST_TMP/web" "net.ipv4.tcp_max_syn_backlog = 8192"
 assert_not_contains "$TEST_TMP/web" "net.ipv4.tcp_slow_start_after_idle"
 
-preview web-single --role web --objective single-stream --target-mbps 800 --rtt-ms 75 --bdp-factor 2
+# The one-click command leaves out these defaults, so they must keep this result.
+preview web-single --role web --target-mbps 800 --rtt-ms 75
+assert_contains "$TEST_TMP/web-single" "objective:        single-stream"
 assert_contains "$TEST_TMP/web-single" "tcp sysctl:       bdp-2x / 15000000 bytes"
 assert_contains "$TEST_TMP/web-single" "net.ipv4.tcp_slow_start_after_idle = 0"
 
@@ -129,8 +137,9 @@ assert_contains "$TEST_TMP/security" "provided (content hidden)"
 assert_not_contains "$TEST_TMP/security" "unique-private-comment"
 assert_not_contains "$TEST_TMP/security" "/etc/sysctl.d/90-vps-bbr-fq.conf"
 assert_contains "$TEST_TMP/security" "system update:    yes"
-assert_contains "$TEST_TMP/security" "old ssh ports:    22 (stay open until confirm-ssh)"
-assert_contains "$TEST_TMP/security" "# BEGIN temporary SSH ports"
+assert_contains "$TEST_TMP/security" "Port 22222"
+assert_not_contains "$TEST_TMP/security" "temporary"
+assert_not_contains "$TEST_TMP/security" "confirm-ssh"
 
 printf '%s\n' "$TEST_PUBLIC_KEY" | bash "$SCRIPT" security --port 22222 --public-key-stdin --no-system-update --dry-run >"$TEST_TMP/security-no-update"
 assert_contains "$TEST_TMP/security-no-update" "system update:    no"

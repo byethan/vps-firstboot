@@ -2,40 +2,110 @@
 set -Eeuo pipefail
 
 SCRIPT_NAME="$(basename "$0")"
+# ---------------------------------------------------------------------------
+# 可配置项
+# 每一项都能用同名环境变量设置，大多数也有对应的命令行参数（见 --help）。
+# 命令行参数优先于环境变量。写着 yes/no 的项只接受这两个值。
+# ---------------------------------------------------------------------------
+
+# 运行哪一部分：all=安全初始化+网络调优，security=只做安全初始化，network=只调网络。
 RUN_PART="${RUN_PART:-all}"
 
+# ----- SSH 登录 -----
+# 安装公钥的用户，必须已经存在，脚本不会新建用户。
 SSH_USER="${SSH_USER:-${NEW_USER:-root}}"
+# 新 SSH 端口，1024-65535。运行 all 或 security 时必填，旧端口会立即关闭。
 SSH_PORT="${SSH_PORT:-}"
+# 公钥的三种传法只能选一种：公钥正文、服务器上的公钥文件、从标准输入读一行（yes/no）。
 PUBLIC_KEY="${PUBLIC_KEY:-}"
 PUBLIC_KEY_FILE="${PUBLIC_KEY_FILE:-}"
 PUBLIC_KEY_STDIN="${PUBLIC_KEY_STDIN:-no}"
-SHOW_SENSITIVE="${SHOW_SENSITIVE:-no}"
+# 没提供公钥时，是否把 root 的 authorized_keys 复制给 SSH_USER。yes/no。
 COPY_ROOT_KEYS="${COPY_ROOT_KEYS:-yes}"
+# 是否安装 fail2ban 保护 SSH 端口。yes/no。
 ENABLE_FAIL2BAN="${ENABLE_FAIL2BAN:-no}"
-ENABLE_BBR_FQ="${ENABLE_BBR_FQ:-yes}"
-ENABLE_BDP_TUNE="${ENABLE_BDP_TUNE:-no}"
-BDP_BANDWIDTH_MBPS="${BDP_BANDWIDTH_MBPS:-}"
-BDP_RTT_MS="${BDP_RTT_MS:-}"
-BDP_EXTRA_MIB="${BDP_EXTRA_MIB:-0}"
-BDP_FACTOR="${BDP_FACTOR:-2}"
-BDP_FACTOR_EXPLICIT="no"
-BDP_BUFFER_BYTES=""
-MANUAL_BUFFER_MIB="${MANUAL_BUFFER_MIB:-}"
-MANUAL_BUFFER_BYTES=""
-ALLOW_UNSAFE_BUFFER="${ALLOW_UNSAFE_BUFFER:-no}"
+
+# ----- 系统 -----
+# 是否升级系统并开启自动安全更新，只支持 apt 系统。yes/no。
+ENABLE_SYSTEM_UPDATE="${ENABLE_SYSTEM_UPDATE:-yes}"
+# 是否配置系统 locale，以及使用哪个 locale。yes/no；locale 名如 en_US.UTF-8。
 ENABLE_LOCALE_FIX="${ENABLE_LOCALE_FIX:-yes}"
 SYSTEM_LOCALE="${SYSTEM_LOCALE:-en_US.UTF-8}"
+# 域名同时有 IPv4 和 IPv6 地址时，是否优先用 IPv4。不会禁用 IPv6。yes/no。
 ENABLE_PREFER_IPV4="${ENABLE_PREFER_IPV4:-yes}"
+
+# ----- BBR 和 TCP 调优 -----
+# 是否启用发行版内核自带的 BBR + fq。yes/no。
+ENABLE_BBR_FQ="${ENABLE_BBR_FQ:-yes}"
+# 机器用途：
+#   general  只开 BBR + fq，保留系统缓冲区
+#   web      建站，加大监听队列并开启 MTU 探测
+#   transit  线路鸡/中转，智能缓冲区、MTU 探测、关闭空闲后的慢启动
+#   exit     落地机，在 transit 基础上扩大临时端口范围并预留 SSH 端口
+TUNE_ROLE="${TUNE_ROLE:-${ROLE:-general}}"
+# 调优目标：
+#   auto           默认；用了 --target-mbps 或 --rtt-ms 就是 single-stream，否则是 balanced
+#   latency        低延迟优先，不放大缓冲区
+#   balanced       日常通用，缓冲区由 role 决定
+#   single-stream  单线程速度优先，缓冲区 = 带宽 x 延迟 x 2
+#   throughput     吞吐优先，缓冲区 = 带宽 x 延迟 x 3，占用内存更多
+#   custom         用 MANUAL_BUFFER_MIB 手动指定缓冲区
+TUNE_OBJECTIVE="${TUNE_OBJECTIVE:-${OBJECTIVE:-auto}}"
+# 是否按带宽和延迟计算缓冲区（BDP）。yes/no；设了带宽或延迟会自动打开。
+ENABLE_BDP_TUNE="${ENABLE_BDP_TUNE:-no}"
+# 想达到的单线程速度，1-100000 Mbps。填真实瓶颈，不是网卡标称的 10G。
+BDP_BANDWIDTH_MBPS="${BDP_BANDWIDTH_MBPS:-}"
+# 客户端到这台 VPS 的延迟，1-10000 ms。
+BDP_RTT_MS="${BDP_RTT_MS:-}"
+# 缓冲区倍数，1-4。single-stream 默认 2，throughput 默认 3。
+BDP_FACTOR="${BDP_FACTOR:-2}"
+# 在计算结果上额外增加的缓冲区，0-64 MiB。
+BDP_EXTRA_MIB="${BDP_EXTRA_MIB:-0}"
+# 手动指定 TCP 最大缓冲区，1-512 MiB，优先级最高。
+MANUAL_BUFFER_MIB="${MANUAL_BUFFER_MIB:-}"
+# 是否允许缓冲区超过按内存算出的安全上限。yes/no。
+ALLOW_UNSAFE_BUFFER="${ALLOW_UNSAFE_BUFFER:-no}"
+# 是否按地区、带宽和内存自动选缓冲区。auto/yes/no；auto 时 transit 和 exit 才开启。
+SMART_TCP_TUNE="${SMART_TCP_TUNE:-auto}"
+# 智能缓冲区用的套餐带宽：auto 或 1-100000 Mbps。auto 读网卡速度，虚拟网卡常常不准。
+TUNE_BANDWIDTH="${TUNE_BANDWIDTH:-${BANDWIDTH:-auto}}"
+# 智能缓冲区用的地区：auto、asia 或 overseas。auto 会访问公网服务查询国家。
+TUNE_REGION="${TUNE_REGION:-${REGION:-auto}}"
+
+# ----- 可选：tc 限速整形 -----
+# 网卡名和出口速率要一起设置，速率如 97mbit；不设就不启用。
+TC_IFACE="${TC_IFACE:-}"
+TC_RATE="${TC_RATE:-}"
+# 可选的 MTU，576-9000；整形的突发大小，如 256k。
+TC_MTU="${TC_MTU:-}"
+TC_BURST="${TC_BURST:-256k}"
+
+# ----- 可选：bpftune 自动调优 -----
+# 是否编译并启用 bpftune。yes/no。需要 systemd 和内核 BTF，小内存机器不建议开。
 ENABLE_BPFTUNE="${ENABLE_BPFTUNE:-no}"
+# bpftune 的仓库地址、分支或标签、源码目录。
 BPFTUNE_REPO="${BPFTUNE_REPO:-https://github.com/byethan/bpftune.git}"
 BPFTUNE_REF="${BPFTUNE_REF:-main}"
 BPFTUNE_SRC_DIR="${BPFTUNE_SRC_DIR:-/usr/local/src/bpftune}"
+
+# ----- 运行方式 -----
+# 只预览不修改。yes/no。
+DRY_RUN="${DRY_RUN:-no}"
+# 不询问确认。yes/no。
+ASSUME_YES="${ASSUME_YES:-no}"
+# 输出里显示国家码、网卡名等诊断信息。yes/no。
+SHOW_SENSITIVE="${SHOW_SENSITIVE:-no}"
+# 网络配置备份目录，必须是绝对路径。
+BACKUP_ROOT="${BACKUP_ROOT:-/root/vps-firstboot-backups}"
+
+# ---------------------------------------------------------------------------
+# 脚本内部状态，不用修改
+# ---------------------------------------------------------------------------
+ACTION="setup"
+BDP_FACTOR_EXPLICIT="no"
+BDP_BUFFER_BYTES=""
+MANUAL_BUFFER_BYTES=""
 TCP_TUNE_ARGS_SEEN="no"
-TUNE_BANDWIDTH="${TUNE_BANDWIDTH:-${BANDWIDTH:-auto}}"
-TUNE_REGION="${TUNE_REGION:-${REGION:-auto}}"
-TUNE_ROLE="${TUNE_ROLE:-${ROLE:-general}}"
-TUNE_OBJECTIVE="${TUNE_OBJECTIVE:-${OBJECTIVE:-auto}}"
-SMART_TCP_TUNE="${SMART_TCP_TUNE:-auto}"
 TUNE_BANDWIDTH_SOURCE="configured"
 TUNE_REGION_SOURCE="configured"
 TUNE_COUNTRY_CODE=""
@@ -47,22 +117,10 @@ TCP_RMEM_MIN=4096
 TCP_RMEM_DEFAULT=131072
 TCP_WMEM_MIN=4096
 TCP_WMEM_DEFAULT=16384
-DRY_RUN="${DRY_RUN:-no}"
-TC_IFACE="${TC_IFACE:-}"
-TC_RATE="${TC_RATE:-}"
-TC_MTU="${TC_MTU:-}"
-TC_BURST="${TC_BURST:-256k}"
-ASSUME_YES="${ASSUME_YES:-no}"
-ACTION="setup"
-BACKUP_ROOT="${BACKUP_ROOT:-/root/vps-firstboot-backups}"
-ENABLE_SYSTEM_UPDATE="${ENABLE_SYSTEM_UPDATE:-yes}"
 SYSTEM_UPDATE_RESULT="not-run"
 SELF_PATH="/usr/local/sbin/vps-firstboot"
 SSHD_INCLUDE_FILE="/etc/ssh/sshd_config.d/00-login-hardening.conf"
 SSHD_LEGACY_INCLUDE_FILE="/etc/ssh/sshd_config.d/99-login-hardening.conf"
-SSH_TEMP_BEGIN="# BEGIN temporary SSH ports: closed by vps-firstboot confirm-ssh"
-SSH_TEMP_END="# END temporary SSH ports"
-SSH_TEMP_PORTS=""
 NETWORK_BACKUP_DONE="no"
 NETWORK_BACKUP_DIR=""
 
@@ -74,7 +132,6 @@ Usage:
   sudo bash vps-firstboot.sh all --port <ssh-port> --key-file /root/admin-key.pub
   sudo bash vps-firstboot.sh --port <ssh-port> --key-file /root/admin-key.pub
   sudo bash vps-firstboot.sh --bandwidth auto --region auto
-  sudo bash vps-firstboot.sh confirm-ssh
   sudo bash vps-firstboot.sh check
   sudo bash vps-firstboot.sh network-rollback -y
 
@@ -146,7 +203,7 @@ Environment variables with the same names also work:
 
 What this script does:
   1. install SSH public keys for an existing SSH user, root by default
-  2. add the SSH port you specify; old ports stay open until confirm-ssh
+  2. move SSH to the port you specify; the old port closes right away
   3. disable SSH password login
   4. keep root login key-only
   5. install system updates and enable automatic security updates on apt systems
@@ -161,17 +218,13 @@ What this script does:
   14. create a systemd service to restore fq on the default route interface
 
 Management subcommands:
-  confirm-ssh
-            Close the temporary old SSH ports. Run it from a session on the new port.
   check     Print OS, kernel source, BBR version, qdisc, SSH ports, and reboot state.
   network-rollback
             Restore the latest managed network configuration backup.
 
 Important:
-  Keep the current SSH session open. Open a second terminal, log in on the new
-  port, and close the old port from there:
-    ssh -p <PORT> <USER>@<SERVER_IP>
-    vps-firstboot confirm-ssh
+  Allow the new port in your provider's firewall first. The old SSH port closes
+  right away, so a blocked new port means reinstalling the machine.
 USAGE
 }
 
@@ -518,7 +571,7 @@ parse_args() {
 
   if [[ $# -gt 0 ]]; then
     case "$1" in
-      check|confirm-ssh|network-rollback)
+      check|network-rollback)
         ACTION="$1"
         shift
         ;;
@@ -1018,21 +1071,9 @@ comment_global_sshd_directives() {
   rm -f "$tmp_file"
 }
 
-print_sshd_temp_ports() {
-  local port
-
-  [[ -n "$SSH_TEMP_PORTS" ]] || return 0
-  printf '%s\n' "$SSH_TEMP_BEGIN"
-  for port in $SSH_TEMP_PORTS; do
-    printf 'Port %s\n' "$port"
-  done
-  printf '%s\n' "$SSH_TEMP_END"
-}
-
 print_sshd_hardening_config() {
-  printf 'Port %s\n' "$SSH_PORT"
-  print_sshd_temp_ports
   cat <<SSHD
+Port $SSH_PORT
 PubkeyAuthentication yes
 PasswordAuthentication no
 ChallengeResponseAuthentication no
@@ -1175,20 +1216,6 @@ sshd_effective_ports() {
   "$(sshd_binary)" -T 2>/dev/null | awk '$1 == "port" {print $2}' || true
 }
 
-# Ports sshd serves now and the new port will not replace yet. They stay open
-# until confirm-ssh, so a blocked or mistyped new port cannot lock anyone out.
-detect_ssh_temp_ports() {
-  local ports
-  local port
-
-  ports="$(sshd_effective_ports)"
-  [[ -n "$ports" ]] || ports=22
-  SSH_TEMP_PORTS=""
-  for port in $ports; do
-    [[ "$port" == "$SSH_PORT" ]] || SSH_TEMP_PORTS="${SSH_TEMP_PORTS:+$SSH_TEMP_PORTS }$port"
-  done
-}
-
 port_is_listening() {
   local port="$1"
   ss -ltnH 2>/dev/null | awk -v port="$port" '{n = split($4, part, ":"); if (part[n] == port) found = 1} END {exit !found}'
@@ -1248,7 +1275,7 @@ allow_ssh_port_in_firewall() {
   nft_rules="$(nft list ruleset 2>/dev/null || true)"
   iptables_rules="$(iptables -S INPUT 2>/dev/null || true)"
   if [[ "$nft_rules" =~ $drop_pattern || "$iptables_rules" == *"-P INPUT DROP"* ]]; then
-    log "warning: the local firewall drops incoming traffic by default; allow TCP $SSH_PORT before closing the old port"
+    log "warning: the local firewall drops incoming traffic by default; TCP $SSH_PORT may be blocked"
   fi
 }
 
@@ -1276,27 +1303,6 @@ restore_sshd_files() {
   done
 }
 
-validate_sshd_or_restore() {
-  local stamp="$1"
-
-  if ! "$(sshd_binary)" -t; then
-    restore_sshd_files "$stamp"
-    die "sshd rejected the new configuration; the previous SSH configuration was restored"
-  fi
-}
-
-restart_sshd_or_restore() {
-  local stamp="$1"
-  local port="$2"
-
-  if restart_sshd_service && wait_for_ssh_port "$port"; then
-    return 0
-  fi
-  restore_sshd_files "$stamp"
-  restart_sshd_service || true
-  die "SSH did not come back on port $port; the previous SSH configuration was restored"
-}
-
 configure_sshd() {
   local sshd_bin
   local stamp
@@ -1319,7 +1325,11 @@ configure_sshd() {
     prepend_inline_sshd_hardening /etc/ssh/sshd_config
   fi
 
-  validate_sshd_or_restore "$stamp"
+  if ! "$sshd_bin" -t; then
+    restore_sshd_files "$stamp"
+    die "sshd rejected the new configuration; the previous SSH configuration was restored"
+  fi
+
   allow_ssh_port_in_firewall
 
   # Socket activation takes its port from the socket unit and leaves
@@ -1329,84 +1339,12 @@ configure_sshd() {
     systemctl enable ssh.service >/dev/null 2>&1 || log "warning: failed to enable ssh.service"
   fi
 
-  restart_sshd_or_restore "$stamp" "$SSH_PORT"
-  if [[ -n "$SSH_TEMP_PORTS" ]]; then
-    log "SSH now listens on $SSH_PORT and, until confirm-ssh, also on: $SSH_TEMP_PORTS"
-  else
-    log "SSH now listens on $SSH_PORT"
+  if ! { restart_sshd_service && wait_for_ssh_port "$SSH_PORT"; }; then
+    restore_sshd_files "$stamp"
+    restart_sshd_service || true
+    die "SSH did not come back on port $SSH_PORT; the previous SSH configuration was restored"
   fi
-}
-
-sshd_temp_block_file() {
-  local file
-
-  for file in "$SSHD_INCLUDE_FILE" /etc/ssh/sshd_config; do
-    if [[ -f "$file" ]] && grep -Fxq "$SSH_TEMP_BEGIN" "$file"; then
-      printf '%s\n' "$file"
-      return 0
-    fi
-  done
-  return 1
-}
-
-sshd_temp_ports_in() {
-  awk -v begin="$SSH_TEMP_BEGIN" -v end="$SSH_TEMP_END" '
-    $0 == begin { inside = 1; next }
-    $0 == end { inside = 0; next }
-    inside && $1 == "Port" { print $2 }
-  ' "$1" | xargs
-}
-
-remove_sshd_temp_block() {
-  local config_file="$1"
-  local tmp_file
-
-  tmp_file="$(mktemp)"
-  awk -v begin="$SSH_TEMP_BEGIN" -v end="$SSH_TEMP_END" '
-    $0 == begin { skip = 1; next }
-    $0 == end { skip = 0; next }
-    !skip { print }
-  ' "$config_file" >"$tmp_file"
-  cat "$tmp_file" >"$config_file"
-  rm -f "$tmp_file"
-}
-
-confirm_ssh() {
-  local connection="${SSH_CONNECTION:-}"
-  local login_port="${connection##* }"
-  local file
-  local ports
-  local port
-  local keep_port
-  local stamp
-
-  [[ "$(id -u)" -eq 0 ]] || die "run as root for confirm-ssh"
-  if ! file="$(sshd_temp_block_file)"; then
-    log "no temporary SSH ports are open; nothing to do"
-    return 0
-  fi
-  ports="$(sshd_temp_ports_in "$file")"
-
-  if [[ -n "$login_port" ]]; then
-    for port in $ports; do
-      [[ "$port" != "$login_port" ]] || die "this session came in through temporary port $port; log in on the new port and run confirm-ssh from there"
-    done
-  else
-    log "warning: no SSH session was detected, so the new port could not be checked"
-    confirm "Close temporary SSH ports: $ports?" || die "aborted"
-  fi
-
-  stamp="$(date +%Y%m%d%H%M%S)"
-  backup_sshd_files "$stamp"
-  remove_sshd_temp_block "$file"
-  validate_sshd_or_restore "$stamp"
-
-  keep_port="$login_port"
-  if [[ -z "$keep_port" ]]; then
-    keep_port="$(sshd_effective_ports | sed -n '1p')"
-  fi
-  restart_sshd_or_restore "$stamp" "$keep_port"
-  log "closed temporary SSH ports: $ports"
+  log "SSH now listens on port $SSH_PORT; the old port is closed"
 }
 
 tcp_buffer_max_bytes() {
@@ -2279,7 +2217,6 @@ Security profile:
   locale fix:       $(locale_plan_value)
   fail2ban:         $ENABLE_FAIL2BAN
   system update:    $ENABLE_SYSTEM_UPDATE
-  old ssh ports:    ${SSH_TEMP_PORTS:-none} (stay open until confirm-ssh)
 
 Would validate and write the SSH hardening drop-in:
 SECURITY_DRYRUN
@@ -2357,7 +2294,6 @@ print_plan() {
   locale fix:        $(locale_plan_value)
   fail2ban:          $ENABLE_FAIL2BAN
   system update:     $ENABLE_SYSTEM_UPDATE
-  old ssh ports:     ${SSH_TEMP_PORTS:-none} (stay open until confirm-ssh)
 SECURITY_PLAN
   else
     printf '  Part 1 security:   skipped\n'
@@ -2382,7 +2318,7 @@ NETWORK_PLAN
   fi
 
   if security_part_enabled; then
-    printf '\nThis will disable SSH password login. Keep the current session open until a second login succeeds.\n\n'
+    printf '\nThis will disable SSH password login and close the old SSH port.\n\n'
   else
     printf '\n'
   fi
@@ -2437,17 +2373,6 @@ default_route_qdiscs() {
   tc qdisc show dev "$iface" 2>/dev/null | awk '{print $2}' | sort -u | xargs
 }
 
-print_ssh_ports_status() {
-  local file
-  local temp_ports="none"
-
-  if file="$(sshd_temp_block_file)"; then
-    temp_ports="$(sshd_temp_ports_in "$file")"
-  fi
-  printf 'ssh_ports: %s\n' "$(sshd_effective_ports | xargs)"
-  printf 'ssh_temporary_ports: %s\n' "$temp_ports"
-}
-
 print_kernel_status() {
   local third_party
 
@@ -2471,7 +2396,7 @@ status_check() {
   for iface in $(ip route show default 2>/dev/null | awk '{print $5}' | sort -u); do
     printf 'qdiscs_on_%s: %s\n' "$iface" "$(default_route_qdiscs "$iface")"
   done
-  print_ssh_ports_status
+  printf 'ssh_ports: %s\n' "$(sshd_effective_ports | xargs)"
   printf 'automatic_updates: %s\n' "$([[ -f /etc/apt/apt.conf.d/20auto-upgrades ]] && echo yes || echo no)"
 }
 
@@ -2502,7 +2427,7 @@ show_verification_status() {
   if security_part_enabled; then
     printf 'system_update: %s\n' "$SYSTEM_UPDATE_RESULT"
     printf 'ssh_listen_target: %s\n' "$(port_is_listening "$SSH_PORT" && echo yes || echo no)"
-    print_ssh_ports_status
+    printf 'ssh_ports: %s\n' "$(sshd_effective_ports | xargs)"
     printf 'pubkeyauthentication: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^pubkeyauthentication / {print $2; exit}')"
     printf 'passwordauthentication: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^passwordauthentication / {print $2; exit}')"
     printf 'permitrootlogin: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^permitrootlogin / {print $2; exit}')"
@@ -2594,7 +2519,7 @@ install_self() {
 
   source="$(readlink -f "$0" 2>/dev/null || true)"
   if [[ ! -f "$source" ]]; then
-    log "warning: this run came from a pipe, so $SELF_PATH was not installed; save the script to a file to use confirm-ssh"
+    log "warning: this run came from a pipe, so the vps-firstboot command was not installed"
     return 0
   fi
   [[ ! "$source" -ef "$SELF_PATH" ]] || return 0
@@ -2610,18 +2535,11 @@ final_message() {
   if security_part_enabled; then
     cat <<SSH_DONE
 
-Do not close this terminal yet. Allow TCP $SSH_PORT in your provider's firewall
-or security group, then log in from a second terminal:
+SSH now listens only on port $SSH_PORT. Log in from a second terminal to check:
   ssh -p $SSH_PORT $SSH_USER@SERVER_IP
-SSH_DONE
-    if [[ -n "$SSH_TEMP_PORTS" ]]; then
-      cat <<SSH_CONFIRM
 
-SSH still listens on the old port(s) too: $SSH_TEMP_PORTS
-After the login above works, run this from that new session to close them:
-  vps-firstboot confirm-ssh
-SSH_CONFIRM
-    fi
+If that fails, allow TCP $SSH_PORT in your provider's firewall or security group.
+SSH_DONE
   fi
 
   if [[ "$SYSTEM_UPDATE_RESULT" == "failed" ]]; then
@@ -2677,10 +2595,6 @@ main() {
       status_check
       exit 0
       ;;
-    confirm-ssh)
-      confirm_ssh
-      exit 0
-      ;;
     network-rollback)
       network_rollback
       exit 0
@@ -2688,9 +2602,6 @@ main() {
   esac
 
   validate_inputs
-  if security_part_enabled; then
-    detect_ssh_temp_ports
-  fi
 
   if [[ "$DRY_RUN" == "yes" ]]; then
     print_tcp_tune_dry_run

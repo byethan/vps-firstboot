@@ -17,63 +17,71 @@
 
 ## 一键初始化
 
-用 root 登录新机器后粘贴下面的命令，先替换前五行里的占位符。命令里只用 ASCII，避免没有设置 locale 的服务器弄乱粘贴内容。
+用 root 登录新机器，先在云厂商的安全组或防火墙里放行新端口，再改好下面的参数并粘贴运行。旧 SSH 端口会立即关闭，新端口连不上就只能重装系统。
 
-`commit` 和 `sum` 固定脚本版本，下载内容不符时命令会停止，不会运行：
+命令里的注释用英文，因为新机器没设置 locale 时，粘贴中文可能被弄乱：
 
 ```bash
-bash <<'VPS'
-set -Eeuo pipefail
-port='<SSH_PORT>'
+# Script version. A tag such as v1.0 is tested; main is the latest code.
+ver=<VERSION>
+
+# Your SSH public key. Root logs in with this key only.
 key='<SSH_PUBLIC_KEY>'
-role='web'; target='<TARGET_Mbps>'; rtt='<RTT_MS>'; factor='2'
-commit='<COMMIT>'
-sum='<SHA256>'
-main=/root/vps-firstboot.sh
-if ! command -v curl >/dev/null; then
-  DEBIAN_FRONTEND=noninteractive apt-get -y -o DPkg::Lock::Timeout=300 update </dev/null
-  DEBIAN_FRONTEND=noninteractive apt-get -y -o DPkg::Lock::Timeout=300 install curl ca-certificates </dev/null
-fi
-curl -fsSL --retry 3 "https://raw.githubusercontent.com/byethan/vps-firstboot/$commit/vps-firstboot.sh" -o "$main" </dev/null
-echo "$sum  $main" | sha256sum -c -
-printf '%s\n' "$key" | bash "$main" all --port "$port" --public-key-stdin --enable-fail2ban \
-  --role "$role" --objective single-stream --target-mbps "$target" --rtt-ms "$rtt" --bdp-factor "$factor" \
-  --yes 2>&1 | tee -a /root/vps-firstboot-run.log
-VPS
+
+args=(
+  --port <SSH_PORT>     # New SSH port, 1024-65535. The old port closes right away.
+  --role web            # general, web, transit or exit.
+  --target-mbps <MBPS>  # Single-stream speed you want, in Mbps.
+  --rtt-ms <RTT_MS>     # Ping from your network to this VPS, in ms.
+  --enable-fail2ban     # Delete this line to skip fail2ban.
+)
+
+url="https://raw.githubusercontent.com/byethan/vps-firstboot/$ver/vps-firstboot.sh"
+command -v curl >/dev/null || { apt-get update; apt-get install -y curl; } </dev/null
+curl -fsSL --retry 3 "$url" -o /root/vps-firstboot.sh &&
+  printf '%s\n' "$key" | bash /root/vps-firstboot.sh all --public-key-stdin --yes "${args[@]}"
 ```
 
-取当前版本的 `commit` 和 `sum`：
+### 参数说明
 
-```bash
-git rev-parse HEAD
-shasum -a 256 vps-firstboot.sh
-```
+| 参数 | 含义 | 可选值 |
+| --- | --- | --- |
+| `ver` | 脚本版本 | 版本标签（如 `v1.0`）是测过的版本；`main` 是最新代码 |
+| `key` | root 登录用的公钥，密码登录会关闭 | 一行 SSH 公钥 |
+| `--port` | 新 SSH 端口，旧端口立即关闭 | `1024`–`65535` |
+| `--role` | 机器用途，见下表 | `general`、`web`、`transit`、`exit` |
+| `--target-mbps` | 想达到的单线程速度，用来算 TCP 缓冲区。填真实瓶颈，不是网卡标称的 10G | `1`–`100000` |
+| `--rtt-ms` | 你的网络到这台 VPS 的延迟，用 `ping` 测 | `1`–`10000` |
+| `--enable-fail2ban` | 安装 fail2ban 保护 SSH 端口 | 不要就删掉这一行 |
 
-跑完后按输出提示操作：
+| `--role` | 适合 | 额外做什么 |
+| --- | --- | --- |
+| `general` | 通用机器 | 只开 BBR + FQ |
+| `web` | 建站 | 加大监听队列，开启 MTU 探测 |
+| `transit` | 线路鸡、中转 | 开启 MTU 探测，关闭空闲后的慢启动 |
+| `exit` | 落地机 | 在 `transit` 基础上扩大临时端口范围，并预留 SSH 端口 |
 
-1. 保持当前窗口不要关。
-2. 在云厂商的安全组或防火墙里放行新端口。
-3. 另开一个窗口，用新端口登录：`ssh -p <SSH_PORT> root@<SERVER_IP>`。
-4. 在新窗口里关闭旧端口：`vps-firstboot confirm-ssh`。
-5. 如果输出提示安装了新内核，执行 `reboot`。
+需要时可以在 `args` 里再加一行：
+
+| 参数 | 作用 | 可选值 |
+| --- | --- | --- |
+| `--bdp-factor` | 缓冲区倍数，默认 2 | `1`–`4` |
+| `--no-system-update` | 不升级系统，也不开自动安全更新 | 无 |
+| `--no-prefer-ipv4` | 不设置 IPv4 优先 | 无 |
+| `--no-locale-fix` | 不配置系统 locale | 无 |
+| `--user` | 给哪个已有用户安装公钥，默认 `root` | 已存在的用户名 |
+
+全部选项可以运行 `bash /root/vps-firstboot.sh --help` 查看，每一项的含义也写在脚本开头的注释里。
 
 ## SSH 端口切换
 
-脚本不会立刻关掉旧端口，新端口连不上时不会把你锁在外面：
-
-- 运行后，sshd 同时监听旧端口和新端口。密码登录立刻关闭，两个端口都只接受密钥。
-- `vps-firstboot confirm-ssh` 要从新端口的会话里运行，这样能确认新端口和密钥都可用。从旧端口的会话运行会被拒绝。
-- 从控制台等非 SSH 环境运行时无法做这项检查，脚本会先询问确认。
-- 如果忘了运行，旧端口会继续开着，但只接受密钥。
-- `vps-firstboot check` 的 `ssh_temporary_ports` 会显示还有哪些旧端口没关。
-
-修改 SSH 配置时：
-
+- 新端口生效后，旧端口立即关闭，密码登录也一起关闭。
 - 目标端口被其他服务占用时直接退出，不改任何文件。
 - 公钥写入前先校验，公钥无效时直接退出。
 - `authorized_keys` 最后一行没有换行时，新公钥不会和它粘在一起。
 - `sshd -t` 校验失败、重启失败或新端口没有监听时，自动恢复原配置。
 - ufw 或 firewalld 启用时自动放行新端口。其他防火墙默认拒绝入站时只给出警告。
+- 脚本不会自动重启。输出提示安装了新内核时，手动执行 `reboot`。
 
 ## 系统更新
 
@@ -202,9 +210,6 @@ bash /root/vps-firstboot.sh network \
 # 查看内核来源、BBR 版本、qdisc、SSH 端口、是否需要重启和自动更新状态
 vps-firstboot check
 
-# 从新端口的会话里关闭旧 SSH 端口
-vps-firstboot confirm-ssh
-
 # 恢复最近一次网络配置备份，不动 SSH 和内核
 vps-firstboot network-rollback -y
 ```
@@ -271,8 +276,7 @@ bash tests/test-vps-firstboot-sandbox.sh
 
 安全部分：
 
-- 新端口可用密钥登录。
-- `confirm-ssh` 之后，`vps-firstboot check` 的 `ssh_temporary_ports` 显示 `none`。
+- 新端口可用密钥登录，`vps-firstboot check` 的 `ssh_ports` 只有新端口。
 - `passwordauthentication no`。
 - root 为 key-only。
 

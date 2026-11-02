@@ -54,6 +54,14 @@ assert_listening() {
   ok
 }
 
+# The config must not leave any other uncommented Port line behind.
+assert_only_port() {
+  local got
+  got="$(awk 'tolower($1) == "port" {print $2}' "$1" | xargs)"
+  [[ "$got" == "$2" ]] || fail "$1 has ports [$got], wanted [$2]"
+  ok
+}
+
 write_stub() {
   cat >"$BOX/bin/$1"
   chmod +x "$BOX/bin/$1"
@@ -360,13 +368,15 @@ expect_ok all --port 20022 --key-file "$TEST_TMP/key.pub" --enable-fail2ban --ro
 ok
 
 assert_has "$BOX/$INCLUDE_REL" "Port 20022"
-assert_has "$BOX/$INCLUDE_REL" "# BEGIN temporary SSH ports"
 assert_has "$BOX/$INCLUDE_REL" "PasswordAuthentication no"
 assert_has "$BOX/etc/ssh/sshd_config" "# managed by vps-firstboot: Port 22"
-assert_listening "22 20022"
+assert_only_port "$BOX/$INCLUDE_REL" 20022
+assert_listening "20022"
 assert_has "$OUT" "ssh_listen_target: yes"
-assert_has "$OUT" "ssh_temporary_ports: 22"
-assert_has "$OUT" "vps-firstboot confirm-ssh"
+assert_has "$OUT" "ssh_ports: 20022"
+assert_has "$OUT" "SSH now listens only on port 20022"
+assert_has "$OUT" "ssh -p 20022 root@SERVER_IP"
+assert_lacks "$OUT" "confirm-ssh"
 assert_has "$OUT" "passwordauthentication: no"
 assert_has "$OUT" "system_update: ok"
 assert_has "$OUT" "kernel_source: official"
@@ -397,58 +407,23 @@ assert_has "$OUT" "tcp_congestion_control: bbr"
 assert_lacks "$BOX/state/calls" "bbrv3"
 assert_lacks "$OUT" "BBRv3"
 
-# ------------------------------------------------------ closing the old port
-SCENARIO="confirm-from-old-port"
-CONNECTION="198.51.100.7 50000 203.0.113.9 22"
-expect_die confirm-ssh --yes
-assert_has "$OUT" "came in through temporary port 22"
-assert_listening "22 20022"
-assert_has "$BOX/$INCLUDE_REL" "# BEGIN temporary SSH ports"
-
-SCENARIO="confirm-from-new-port"
-CONNECTION="198.51.100.7 50000 203.0.113.9 20022"
-expect_ok confirm-ssh
-assert_has "$OUT" "closed temporary SSH ports: 22"
-assert_listening "20022"
-assert_lacks "$BOX/$INCLUDE_REL" "temporary SSH ports"
-assert_has "$BOX/$INCLUDE_REL" "Port 20022"
-
-SCENARIO="confirm-twice"
-expect_ok confirm-ssh
-assert_has "$OUT" "nothing to do"
-assert_listening "20022"
-
-SCENARIO="rerun-after-confirm"
-CONNECTION=""
+# ------------------------------------------------------- moving the SSH port
+SCENARIO="rerun-on-same-port"
 expect_ok "${SECURITY[@]}" --no-system-update
 assert_listening "20022"
-assert_lacks "$BOX/$INCLUDE_REL" "temporary SSH ports"
-assert_has "$OUT" "ssh_temporary_ports: none"
-assert_lacks "$OUT" "vps-firstboot confirm-ssh"
+assert_only_port "$BOX/$INCLUDE_REL" 20022
 [[ "$(grep -c "$(cut -d' ' -f2 "$TEST_TMP/key.pub")" "$BOX/root/.ssh/authorized_keys")" == "1" ]] || fail "key was added twice"
 ok
 
-new_box rerun-before-confirm
+new_box move-from-another-port 2222
 expect_ok "${SECURITY[@]}" --no-system-update
-expect_ok "${SECURITY[@]}" --no-system-update
-assert_listening "22 20022"
-assert_has "$BOX/$INCLUDE_REL" "# BEGIN temporary SSH ports"
-
-new_box move-to-another-port 2222
-expect_ok "${SECURITY[@]}" --no-system-update
-assert_listening "2222 20022"
-assert_has "$OUT" "ssh_temporary_ports: 2222"
-
-new_box confirm-without-session
-expect_ok "${SECURITY[@]}" --no-system-update
-expect_ok confirm-ssh --yes
-assert_has "$OUT" "no SSH session was detected"
 assert_listening "20022"
+assert_only_port "$BOX/$INCLUDE_REL" 20022
+assert_has "$BOX/etc/ssh/sshd_config" "# managed by vps-firstboot: Port 2222"
 
 new_box already-on-target 20022
 expect_ok "${SECURITY[@]}" --no-system-update
 assert_listening "20022"
-assert_lacks "$OUT" "vps-firstboot confirm-ssh"
 
 # -------------------------------------------------------- nothing gets locked
 new_box port-taken
@@ -496,26 +471,12 @@ assert_has "$OUT" "SSH did not come back on port 20022"
 assert_absent "$BOX/$INCLUDE_REL"
 assert_listening "22"
 
-new_box confirm-restart-fails
-expect_ok "${SECURITY[@]}" --no-system-update
-touch "$BOX/state/sshd-t-fails"
-CONNECTION="198.51.100.7 50000 203.0.113.9 20022"
-expect_die confirm-ssh
-assert_has "$BOX/$INCLUDE_REL" "# BEGIN temporary SSH ports"
-CONNECTION=""
-
 new_box no-include-support
 touch "$BOX/state/no-include"
 expect_ok "${SECURITY[@]}" --no-system-update
 assert_absent "$BOX/$INCLUDE_REL"
-assert_has "$BOX/etc/ssh/sshd_config" "# BEGIN temporary SSH ports"
-assert_listening "22 20022"
-CONNECTION="198.51.100.7 50000 203.0.113.9 20022"
-expect_ok confirm-ssh
-assert_lacks "$BOX/etc/ssh/sshd_config" "temporary SSH ports"
-assert_has "$BOX/etc/ssh/sshd_config" "Port 20022"
+assert_only_port "$BOX/etc/ssh/sshd_config" 20022
 assert_listening "20022"
-CONNECTION=""
 
 # ------------------------------------------------------------------ firewalls
 new_box ufw-active
@@ -552,7 +513,7 @@ printf 'full-upgrade\n' >"$BOX/state/apt-fails-on"
 expect_ok all --port 20022 --key-file "$TEST_TMP/key.pub" --role general --yes
 assert_has "$OUT" "system_update: failed"
 assert_has "$OUT" "System update failed"
-assert_listening "22 20022"
+assert_listening "20022"
 assert_exists "$BOX/etc/sysctl.d/90-vps-bbr-fq.conf"
 assert_lacks "$BOX/state/calls" "install unattended-upgrades"
 
@@ -622,7 +583,7 @@ new_box fail2ban-failure-does-not-stop-setup
 printf 'fail2ban\n' >"$BOX/state/apt-fails-on"
 expect_ok "${SECURITY[@]}" --enable-fail2ban --no-system-update
 assert_has "$OUT" "fail2ban setup failed"
-assert_has "$OUT" "vps-firstboot confirm-ssh"
+assert_has "$OUT" "SSH now listens only on port 20022"
 
 # --------------------------------------------------------- kernels and reboot
 new_box third-party-kernel
@@ -651,18 +612,17 @@ expect_ok check
 assert_has "$OUT" "kernel_source: official"
 assert_has "$OUT" "tcp_bbr_version: 1"
 assert_has "$OUT" "ssh_ports: 22"
-assert_has "$OUT" "ssh_temporary_ports: none"
 assert_has "$OUT" "automatic_updates: no"
 assert_has "$OUT" "qdiscs_on_eth0: fq"
 assert_listening "22"
 assert_absent "$BOX/$INCLUDE_REL"
 
-new_box check-pending-v3
+new_box check-v3
 expect_ok "${SECURITY[@]}" --no-system-update
 printf '3\n' >"$BOX/sys/module/tcp_bbr/version"
 expect_ok check
 assert_has "$OUT" "tcp_bbr_version: 3"
-assert_has "$OUT" "ssh_temporary_ports: 22"
+assert_has "$OUT" "ssh_ports: 20022"
 
 # ------------------------------------------------------------ network rollback
 new_box network-rollback
@@ -704,51 +664,21 @@ installed_ok() {
   ok
 }
 
-installed_die() {
-  run_installed "$@"
-  [[ "$STATUS" != "0" ]] || fail "wanted failure, got success from: $*"
-  ok
-}
-
 new_box round-trip-from-installed-copy 20022
 printf '%s\n' "$NEW_KEY" >"$BOX/root/.ssh/authorized_keys"
 cp "$BOX/root/.ssh/authorized_keys" "$BOX/state/keys.before"
 expect_ok security --port 20022 --no-system-update --yes
 assert_listening "20022"
 
-CONNECTION="198.51.100.7 50000 203.0.113.9 20022"
-installed_ok confirm-ssh
-assert_has "$OUT" "nothing to do"
-
 installed_ok security --port 20023 --no-system-update --yes
-assert_listening "20022 20023"
-assert_has "$OUT" "ssh_temporary_ports: 20022"
+assert_listening "20023"
 assert_lacks "$BOX/state/calls" "full-upgrade"
 
-installed_die confirm-ssh
-assert_has "$OUT" "came in through temporary port 20022"
-assert_listening "20022 20023"
-
-CONNECTION="198.51.100.7 50000 203.0.113.9 20023"
-installed_ok confirm-ssh
-assert_has "$OUT" "closed temporary SSH ports: 20022"
-assert_listening "20023"
-
 installed_ok security --port 20022 --no-system-update --yes
-assert_listening "20022 20023"
-assert_has "$OUT" "ssh_temporary_ports: 20023"
-
-installed_die confirm-ssh
-assert_has "$OUT" "came in through temporary port 20023"
-
-CONNECTION="198.51.100.7 50000 203.0.113.9 20022"
-installed_ok confirm-ssh
 assert_listening "20022"
 installed_ok check
 assert_has "$OUT" "ssh_ports: 20022"
-assert_has "$OUT" "ssh_temporary_ports: none"
 cmp -s "$BOX/root/.ssh/authorized_keys" "$BOX/state/keys.before" || fail "authorized_keys changed"
 ok
-CONNECTION=""
 
 printf 'vps-firstboot sandbox tests passed (%s checks)\n' "$CHECKS"
