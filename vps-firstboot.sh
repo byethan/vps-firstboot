@@ -13,7 +13,6 @@ SHOW_SENSITIVE="${SHOW_SENSITIVE:-no}"
 COPY_ROOT_KEYS="${COPY_ROOT_KEYS:-yes}"
 ENABLE_FAIL2BAN="${ENABLE_FAIL2BAN:-no}"
 ENABLE_BBR_FQ="${ENABLE_BBR_FQ:-yes}"
-ENABLE_VPS_SYSCTL="${ENABLE_VPS_SYSCTL:-no}"
 ENABLE_BDP_TUNE="${ENABLE_BDP_TUNE:-no}"
 BDP_BANDWIDTH_MBPS="${BDP_BANDWIDTH_MBPS:-}"
 BDP_RTT_MS="${BDP_RTT_MS:-}"
@@ -27,13 +26,11 @@ ALLOW_UNSAFE_BUFFER="${ALLOW_UNSAFE_BUFFER:-no}"
 ENABLE_LOCALE_FIX="${ENABLE_LOCALE_FIX:-yes}"
 SYSTEM_LOCALE="${SYSTEM_LOCALE:-en_US.UTF-8}"
 ENABLE_PREFER_IPV4="${ENABLE_PREFER_IPV4:-yes}"
-ENABLE_BBRV3_KERNEL="${ENABLE_BBRV3_KERNEL:-no}"
 ENABLE_BPFTUNE="${ENABLE_BPFTUNE:-no}"
 BPFTUNE_REPO="${BPFTUNE_REPO:-https://github.com/byethan/bpftune.git}"
 BPFTUNE_REF="${BPFTUNE_REF:-main}"
 BPFTUNE_SRC_DIR="${BPFTUNE_SRC_DIR:-/usr/local/src/bpftune}"
 TCP_TUNE_ARGS_SEEN="no"
-TCP_TUNE_ONLY="${TCP_TUNE_ONLY:-no}"
 TUNE_BANDWIDTH="${TUNE_BANDWIDTH:-${BANDWIDTH:-auto}}"
 TUNE_REGION="${TUNE_REGION:-${REGION:-auto}}"
 TUNE_ROLE="${TUNE_ROLE:-${ROLE:-general}}"
@@ -56,21 +53,18 @@ TC_RATE="${TC_RATE:-}"
 TC_MTU="${TC_MTU:-}"
 TC_BURST="${TC_BURST:-256k}"
 ASSUME_YES="${ASSUME_YES:-no}"
-BBRV3_ACTION="setup"
-BBRV3_REPO="${BBRV3_REPO:-byJoey/Actions-bbr-v3}"
-BBRV3_VERSION="${BBRV3_VERSION:-}"
-BBRV3_FLAVOR="${BBRV3_FLAVOR:-standard}"
-BBRV3_LOCK_VERSION="${BBRV3_LOCK_VERSION:-yes}"
-BBRV3_LOCK_FILE="${BBRV3_LOCK_FILE:-/etc/vps-firstboot/bbrv3-version.lock}"
-BBRV3_INSTALL_DIR="${BBRV3_INSTALL_DIR:-/var/cache/vps-firstboot/bbrv3}"
-BBRV3_BACKUP_ROOT="${BBRV3_BACKUP_ROOT:-/root/vps-firstboot-backups}"
-BBRV3_STATE_ROOT="${BBRV3_STATE_ROOT:-/var/lib/vps-firstboot/bbrv3}"
-BBRV3_SELECTED_TAG=""
-BBRV3_NEEDS_REBOOT="no"
-BBRV3_BACKUP_DONE="no"
+ACTION="setup"
+BACKUP_ROOT="${BACKUP_ROOT:-/root/vps-firstboot-backups}"
+ENABLE_SYSTEM_UPDATE="${ENABLE_SYSTEM_UPDATE:-yes}"
+SYSTEM_UPDATE_RESULT="not-run"
+SELF_PATH="/usr/local/sbin/vps-firstboot"
+SSHD_INCLUDE_FILE="/etc/ssh/sshd_config.d/00-login-hardening.conf"
+SSHD_LEGACY_INCLUDE_FILE="/etc/ssh/sshd_config.d/99-login-hardening.conf"
+SSH_TEMP_BEGIN="# BEGIN temporary SSH ports: closed by vps-firstboot confirm-ssh"
+SSH_TEMP_END="# END temporary SSH ports"
+SSH_TEMP_PORTS=""
 NETWORK_BACKUP_DONE="no"
 NETWORK_BACKUP_DIR=""
-NETWORK_TUNE_APPLIED="no"
 
 usage() {
   cat <<'USAGE'
@@ -80,9 +74,8 @@ Usage:
   sudo bash vps-firstboot.sh all --port <ssh-port> --key-file /root/admin-key.pub
   sudo bash vps-firstboot.sh --port <ssh-port> --key-file /root/admin-key.pub
   sudo bash vps-firstboot.sh --bandwidth auto --region auto
-  sudo bash vps-firstboot.sh install -y
+  sudo bash vps-firstboot.sh confirm-ssh
   sudo bash vps-firstboot.sh check
-  sudo bash vps-firstboot.sh rollback -y
   sudo bash vps-firstboot.sh network-rollback -y
 
 Options:
@@ -98,10 +91,9 @@ Options:
   --no-copy-root-keys   Do not copy /root/.ssh/authorized_keys as fallback
   --enable-fail2ban     Install and configure fail2ban for the SSH port
   --no-fail2ban         Do not install and configure fail2ban
+  --no-system-update    Skip apt upgrades and automatic security updates
   --enable-bbr-fq       Enable Linux TCP BBR with fq qdisc. Default: yes
   --no-bbr-fq           Do not configure Linux TCP BBR with fq qdisc
-  --enable-vps-sysctl   Deprecated compatibility flag; aggressive TCP/sysctl tuning is not written
-  --no-vps-sysctl       Keep only the minimal BBR/fq sysctl baseline. Default: yes
   --enable-bdp-tune     Write BDP-based tcp_rmem/tcp_wmem max values
   --no-bdp-tune         Disable BDP-based TCP buffer values
   --bdp-bandwidth MBPS  Bottleneck bandwidth for BDP calculation, for example 600
@@ -112,8 +104,6 @@ Options:
   --system-locale NAME  Locale to generate and set. Default: en_US.UTF-8
   --prefer-ipv4         Prefer IPv4 when hostnames have both A and AAAA records. Default: yes
   --no-prefer-ipv4      Do not configure /etc/gai.conf IPv4 preference
-  --enable-bbrv3-kernel Install standard BBRv3 kernel during normal setup. Default: no
-  --no-bbrv3-kernel     Skip BBRv3 kernel install during normal setup
   --enable-bpftune      Build, install, and enable bpftune BPF auto-tuning daemon
   --no-bpftune          Do not install or enable bpftune. Default: no
   --bpftune-repo URL    bpftune git repository. Default: https://github.com/byethan/bpftune.git
@@ -138,58 +128,50 @@ Options:
   --tc-rate RATE        Egress shaping rate, for example 97mbit
   --tc-mtu MTU          Optional MTU to set before shaping, for example 1492
   --tc-burst BURST      Optional HTB burst size. Default: 256k
-  --bbrv3-version TAG   BBRv3 release tag to install. Default: locked tag, then latest
-  --bbrv3-repo OWNER/REPO
-                        BBRv3 release repository. Default: byJoey/Actions-bbr-v3
-  --bbrv3-standard      Install standard BBRv3 kernel. Default: yes
-  --bbrv3-max           Install BBRv3 Max kernel. Not recommended for production
-  --lock-bbrv3-version  Lock selected BBRv3 release tag for future installs. Default: yes
-  --no-lock-bbrv3-version
-                        Do not write/update the BBRv3 version lock
   -y, --yes             Non-interactive mode
   -h, --help            Show this help
 
 Environment variables with the same names also work:
   SSH_USER, SSH_PORT, PUBLIC_KEY, PUBLIC_KEY_FILE, PUBLIC_KEY_STDIN, SHOW_SENSITIVE,
   COPY_ROOT_KEYS, ENABLE_FAIL2BAN,
-  ENABLE_BBR_FQ, ENABLE_VPS_SYSCTL, ENABLE_LOCALE_FIX, SYSTEM_LOCALE,
-  ENABLE_PREFER_IPV4, ENABLE_BBRV3_KERNEL,
+  ENABLE_SYSTEM_UPDATE, ENABLE_BBR_FQ, ENABLE_LOCALE_FIX, SYSTEM_LOCALE,
+  ENABLE_PREFER_IPV4,
   RUN_PART, TUNE_OBJECTIVE, OBJECTIVE,
   ENABLE_BDP_TUNE, BDP_BANDWIDTH_MBPS, BDP_RTT_MS, BDP_EXTRA_MIB, BDP_FACTOR,
   MANUAL_BUFFER_MIB, ALLOW_UNSAFE_BUFFER,
-  ENABLE_BPFTUNE, BPFTUNE_REPO, BPFTUNE_REF, BPFTUNE_SRC_DIR, TCP_TUNE_ONLY,
+  ENABLE_BPFTUNE, BPFTUNE_REPO, BPFTUNE_REF, BPFTUNE_SRC_DIR,
   TUNE_BANDWIDTH, BANDWIDTH, TUNE_REGION, REGION, TUNE_ROLE, ROLE, SMART_TCP_TUNE,
   DRY_RUN, TC_IFACE, TC_RATE,
-  TC_MTU, TC_BURST, ASSUME_YES, BBRV3_REPO, BBRV3_VERSION, BBRV3_FLAVOR,
-  BBRV3_LOCK_VERSION, BBRV3_LOCK_FILE, BBRV3_INSTALL_DIR, BBRV3_BACKUP_ROOT
+  TC_MTU, TC_BURST, ASSUME_YES, BACKUP_ROOT
 
 What this script does:
   1. install SSH public keys for an existing SSH user, root by default
-  2. move SSH to the port you specify
+  2. add the SSH port you specify; old ports stay open until confirm-ssh
   3. disable SSH password login
   4. keep root login key-only
-  5. enable Linux TCP BBR with fq qdisc by default
-  6. tune conservatively by VPS role; general stays at only BBR + fq by default
-  7. optionally write memory-capped smart buffers or explicit BDP-based buffers
-  8. configure a UTF-8 system locale and avoid invalid SSH LC_* imports
-  9. prefer IPv4 for dual-stack hostname resolution without disabling IPv6
-  10. optionally install standard BBRv3 kernel, without automatic reboot
+  5. install system updates and enable automatic security updates on apt systems
+  6. enable TCP BBR with fq qdisc from the distribution kernel
+  7. tune conservatively by VPS role; general stays at only BBR + fq by default
+  8. optionally write memory-capped smart buffers or explicit BDP-based buffers
+  9. configure a UTF-8 system locale and avoid invalid SSH LC_* imports
+  10. prefer IPv4 for dual-stack hostname resolution without disabling IPv6
   11. optionally build and enable bpftune for BPF-driven Linux auto-tuning
   12. optionally install fail2ban and protect the SSH port
   13. optionally configure tc egress shaping when iface and rate are supplied
   14. create a systemd service to restore fq on the default route interface
 
 Management subcommands:
-  install   Install the standard BBRv3 kernel from GitHub Releases, enable BBR + fq,
-            clean legacy aggressive sysctl snippets, and do not reboot automatically.
-  check     Print OS, kernel, BBR module, qdisc, congestion control, lock, and reboot state.
-  rollback  Restore latest sysctl backup and remove non-running BBRv3 kernel packages when safe.
+  confirm-ssh
+            Close the temporary old SSH ports. Run it from a session on the new port.
+  check     Print OS, kernel source, BBR version, qdisc, SSH ports, and reboot state.
   network-rollback
-            Restore the latest managed network configuration backup without removing kernels.
+            Restore the latest managed network configuration backup.
 
 Important:
-  Keep the current SSH session open. Open a second terminal and test:
+  Keep the current SSH session open. Open a second terminal, log in on the new
+  port, and close the old port from there:
     ssh -p <PORT> <USER>@<SERVER_IP>
+    vps-firstboot confirm-ssh
 USAGE
 }
 
@@ -218,10 +200,6 @@ security_part_enabled() {
 
 network_part_enabled() {
   [[ "$RUN_PART" == "all" || "$RUN_PART" == "network" ]]
-}
-
-ssh_hardening_enabled() {
-  security_part_enabled
 }
 
 normalize_region() {
@@ -529,7 +507,6 @@ parse_args() {
         ;;
       network)
         RUN_PART="network"
-        TCP_TUNE_ONLY="yes"
         shift
         ;;
       all|setup)
@@ -541,10 +518,12 @@ parse_args() {
 
   if [[ $# -gt 0 ]]; then
     case "$1" in
-      install|check|rollback|network-rollback)
-        RUN_PART="network"
-        BBRV3_ACTION="$1"
+      check|confirm-ssh|network-rollback)
+        ACTION="$1"
         shift
+        ;;
+      install|rollback)
+        die "the third-party BBRv3 kernel was removed; this script uses BBR from the distribution kernel"
         ;;
     esac
   fi
@@ -592,20 +571,23 @@ parse_args() {
         ENABLE_FAIL2BAN="no"
         shift
         ;;
+      --no-system-update)
+        ENABLE_SYSTEM_UPDATE="no"
+        shift
+        ;;
+      --no-bbrv3-kernel|--enable-vps-sysctl|--no-vps-sysctl)
+        log "notice: $1 no longer has any effect"
+        shift
+        ;;
+      --enable-bbrv3-kernel|--bbrv3-version|--bbrv3-repo|--bbrv3-standard|--bbrv3-max|--lock-bbrv3-version|--no-lock-bbrv3-version)
+        die "$1 was removed; this script uses BBR from the distribution kernel"
+        ;;
       --enable-bbr-fq)
         ENABLE_BBR_FQ="yes"
         shift
         ;;
       --no-bbr-fq)
         ENABLE_BBR_FQ="no"
-        shift
-        ;;
-      --enable-vps-sysctl)
-        ENABLE_VPS_SYSCTL="yes"
-        shift
-        ;;
-      --no-vps-sysctl)
-        ENABLE_VPS_SYSCTL="no"
         shift
         ;;
       --enable-bdp-tune)
@@ -662,14 +644,6 @@ parse_args() {
         TCP_TUNE_ARGS_SEEN="yes"
         shift
         ;;
-      --enable-bbrv3-kernel)
-        ENABLE_BBRV3_KERNEL="yes"
-        shift
-        ;;
-      --no-bbrv3-kernel)
-        ENABLE_BBRV3_KERNEL="no"
-        shift
-        ;;
       --enable-bpftune)
         ENABLE_BPFTUNE="yes"
         TCP_TUNE_ARGS_SEEN="yes"
@@ -700,13 +674,11 @@ parse_args() {
         ;;
       --network-only|--tcp-tune-only)
         RUN_PART="network"
-        TCP_TUNE_ONLY="yes"
         TCP_TUNE_ARGS_SEEN="yes"
         shift
         ;;
       --security-only)
         RUN_PART="security"
-        TCP_TUNE_ONLY="no"
         shift
         ;;
       --role)
@@ -810,32 +782,6 @@ parse_args() {
         TCP_TUNE_ARGS_SEEN="yes"
         shift 2
         ;;
-      --bbrv3-version)
-        [[ $# -ge 2 ]] || die "--bbrv3-version requires a value"
-        BBRV3_VERSION="${2:-}"
-        shift 2
-        ;;
-      --bbrv3-repo)
-        [[ $# -ge 2 ]] || die "--bbrv3-repo requires a value"
-        BBRV3_REPO="${2:-}"
-        shift 2
-        ;;
-      --bbrv3-standard)
-        BBRV3_FLAVOR="standard"
-        shift
-        ;;
-      --bbrv3-max)
-        BBRV3_FLAVOR="max"
-        shift
-        ;;
-      --lock-bbrv3-version)
-        BBRV3_LOCK_VERSION="yes"
-        shift
-        ;;
-      --no-lock-bbrv3-version)
-        BBRV3_LOCK_VERSION="no"
-        shift
-        ;;
       -y|--yes)
         ASSUME_YES="yes"
         shift
@@ -863,7 +809,6 @@ compute_bdp_buffer_bytes() {
 validate_inputs() {
   if [[ "$RUN_PART" == "all" && -z "$SSH_PORT" && "$TCP_TUNE_ARGS_SEEN" == "yes" ]]; then
     RUN_PART="network"
-    TCP_TUNE_ONLY="yes"
   fi
 
   if [[ -n "$BDP_BANDWIDTH_MBPS" || -n "$BDP_RTT_MS" ]]; then
@@ -889,15 +834,13 @@ validate_inputs() {
   [[ "$SHOW_SENSITIVE" =~ ^(yes|no)$ ]] || die "SHOW_SENSITIVE must be yes or no"
   [[ "$COPY_ROOT_KEYS" =~ ^(yes|no)$ ]] || die "COPY_ROOT_KEYS must be yes or no"
   [[ "$ENABLE_FAIL2BAN" =~ ^(yes|no)$ ]] || die "ENABLE_FAIL2BAN must be yes or no"
+  [[ "$ENABLE_SYSTEM_UPDATE" =~ ^(yes|no)$ ]] || die "ENABLE_SYSTEM_UPDATE must be yes or no"
   [[ "$ENABLE_BBR_FQ" =~ ^(yes|no)$ ]] || die "ENABLE_BBR_FQ must be yes or no"
-  [[ "$ENABLE_VPS_SYSCTL" =~ ^(yes|no)$ ]] || die "ENABLE_VPS_SYSCTL must be yes or no"
   [[ "$ENABLE_BDP_TUNE" =~ ^(yes|no)$ ]] || die "ENABLE_BDP_TUNE must be yes or no"
   [[ "$SMART_TCP_TUNE" =~ ^(yes|no)$ ]] || die "SMART_TCP_TUNE must be auto, yes, or no"
   [[ "$ENABLE_LOCALE_FIX" =~ ^(yes|no)$ ]] || die "ENABLE_LOCALE_FIX must be yes or no"
   [[ "$ENABLE_PREFER_IPV4" =~ ^(yes|no)$ ]] || die "ENABLE_PREFER_IPV4 must be yes or no"
-  [[ "$ENABLE_BBRV3_KERNEL" =~ ^(yes|no)$ ]] || die "ENABLE_BBRV3_KERNEL must be yes or no"
   [[ "$ENABLE_BPFTUNE" =~ ^(yes|no)$ ]] || die "ENABLE_BPFTUNE must be yes or no"
-  [[ "$TCP_TUNE_ONLY" =~ ^(yes|no)$ ]] || die "TCP_TUNE_ONLY must be yes or no"
   [[ "$DRY_RUN" =~ ^(yes|no)$ ]] || die "DRY_RUN must be yes or no"
   [[ "$ASSUME_YES" =~ ^(yes|no)$ ]] || die "ASSUME_YES must be yes or no"
   [[ "$ALLOW_UNSAFE_BUFFER" =~ ^(yes|no)$ ]] || die "ALLOW_UNSAFE_BUFFER must be yes or no"
@@ -955,7 +898,7 @@ validate_inputs() {
     [[ "$(id -u)" -eq 0 ]] || die "run as root, for example: sudo bash $SCRIPT_NAME"
   fi
 
-  if ssh_hardening_enabled; then
+  if security_part_enabled; then
     [[ -n "$SSH_USER" ]] || die "--user cannot be empty"
     [[ -n "$SSH_PORT" ]] || die "--port is required"
     [[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "invalid Linux user name: $SSH_USER"
@@ -1017,11 +960,21 @@ install_authorized_keys() {
   user_group="$(id -gn "$SSH_USER")"
   auth_keys="$user_home/.ssh/authorized_keys"
 
+  if [[ -n "$PUBLIC_KEY" ]] && command -v ssh-keygen >/dev/null 2>&1; then
+    if ! printf '%s\n' "$PUBLIC_KEY" | ssh-keygen -l -f - >/dev/null 2>&1; then
+      die "the supplied public key is not valid; nothing was changed"
+    fi
+  fi
+
   install -d -m 0700 -o "$SSH_USER" -g "$user_group" "$user_home/.ssh"
 
   if [[ -n "$PUBLIC_KEY" ]]; then
     touch "$auth_keys"
     if ! grep -Fxq "$PUBLIC_KEY" "$auth_keys"; then
+      # A last line without a newline would otherwise merge with the new key.
+      if [[ -n "$(tail -c 1 "$auth_keys")" ]]; then
+        printf '\n' >>"$auth_keys"
+      fi
       printf '%s\n' "$PUBLIC_KEY" >>"$auth_keys"
     fi
   elif [[ "$COPY_ROOT_KEYS" == "yes" && -s "$source_keys" ]]; then
@@ -1065,9 +1018,21 @@ comment_global_sshd_directives() {
   rm -f "$tmp_file"
 }
 
+print_sshd_temp_ports() {
+  local port
+
+  [[ -n "$SSH_TEMP_PORTS" ]] || return 0
+  printf '%s\n' "$SSH_TEMP_BEGIN"
+  for port in $SSH_TEMP_PORTS; do
+    printf 'Port %s\n' "$port"
+  done
+  printf '%s\n' "$SSH_TEMP_END"
+}
+
 print_sshd_hardening_config() {
+  printf 'Port %s\n' "$SSH_PORT"
+  print_sshd_temp_ports
   cat <<SSHD
-Port $SSH_PORT
 PubkeyAuthentication yes
 PasswordAuthentication no
 ChallengeResponseAuthentication no
@@ -1199,41 +1164,316 @@ restart_sshd_service() {
     fi
   fi
 
-  die "failed to restart SSH service; try manually: systemctl restart sshd.service"
+  return 1
+}
+
+sshd_binary() {
+  command -v sshd 2>/dev/null || printf '/usr/sbin/sshd\n'
+}
+
+sshd_effective_ports() {
+  "$(sshd_binary)" -T 2>/dev/null | awk '$1 == "port" {print $2}' || true
+}
+
+# Ports sshd serves now and the new port will not replace yet. They stay open
+# until confirm-ssh, so a blocked or mistyped new port cannot lock anyone out.
+detect_ssh_temp_ports() {
+  local ports
+  local port
+
+  ports="$(sshd_effective_ports)"
+  [[ -n "$ports" ]] || ports=22
+  SSH_TEMP_PORTS=""
+  for port in $ports; do
+    [[ "$port" == "$SSH_PORT" ]] || SSH_TEMP_PORTS="${SSH_TEMP_PORTS:+$SSH_TEMP_PORTS }$port"
+  done
+}
+
+port_is_listening() {
+  local port="$1"
+  ss -ltnH 2>/dev/null | awk -v port="$port" '{n = split($4, part, ":"); if (part[n] == port) found = 1} END {exit !found}'
+}
+
+wait_for_ssh_port() {
+  local port="$1"
+  local attempt
+
+  command -v ss >/dev/null 2>&1 || return 0
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    port_is_listening "$port" && return 0
+    sleep 1
+  done
+  return 1
+}
+
+check_ssh_port_available() {
+  local listeners
+
+  command -v ss >/dev/null 2>&1 || return 0
+  listeners="$(ss -ltnpH "sport = :$SSH_PORT" 2>/dev/null || true)"
+  [[ -n "$listeners" ]] || return 0
+  [[ "$listeners" == *'"sshd"'* || "$listeners" == *'"systemd"'* ]] && return 0
+  die "TCP port $SSH_PORT is already used by another service; choose a different --port"
+}
+
+allow_ssh_port_in_firewall() {
+  local handled="no"
+  local status
+  local nft_rules
+  local iptables_rules
+  local drop_pattern='hook input[^;]*;[[:space:]]*policy drop'
+
+  if command -v ufw >/dev/null 2>&1; then
+    status="$(ufw status 2>/dev/null || true)"
+    if [[ "$status" == *"Status: active"* ]]; then
+      handled="yes"
+      if ufw allow "$SSH_PORT/tcp" >/dev/null 2>&1; then
+        log "opened TCP $SSH_PORT in ufw"
+      else
+        log "warning: failed to open TCP $SSH_PORT in ufw"
+      fi
+    fi
+  fi
+
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    handled="yes"
+    if firewall-cmd --permanent --add-port="$SSH_PORT/tcp" >/dev/null 2>&1 && firewall-cmd --reload >/dev/null 2>&1; then
+      log "opened TCP $SSH_PORT in firewalld"
+    else
+      log "warning: failed to open TCP $SSH_PORT in firewalld"
+    fi
+  fi
+
+  [[ "$handled" == "no" ]] || return 0
+  nft_rules="$(nft list ruleset 2>/dev/null || true)"
+  iptables_rules="$(iptables -S INPUT 2>/dev/null || true)"
+  if [[ "$nft_rules" =~ $drop_pattern || "$iptables_rules" == *"-P INPUT DROP"* ]]; then
+    log "warning: the local firewall drops incoming traffic by default; allow TCP $SSH_PORT before closing the old port"
+  fi
+}
+
+backup_sshd_files() {
+  local stamp="$1"
+  local file
+
+  for file in /etc/ssh/sshd_config "$SSHD_INCLUDE_FILE" "$SSHD_LEGACY_INCLUDE_FILE"; do
+    if [[ -e "$file" ]]; then
+      cp -p "$file" "$file.bak.$stamp"
+    fi
+  done
+}
+
+restore_sshd_files() {
+  local stamp="$1"
+  local file
+
+  for file in /etc/ssh/sshd_config "$SSHD_INCLUDE_FILE" "$SSHD_LEGACY_INCLUDE_FILE"; do
+    if [[ -e "$file.bak.$stamp" ]]; then
+      cp -p "$file.bak.$stamp" "$file"
+    else
+      rm -f "$file"
+    fi
+  done
+}
+
+validate_sshd_or_restore() {
+  local stamp="$1"
+
+  if ! "$(sshd_binary)" -t; then
+    restore_sshd_files "$stamp"
+    die "sshd rejected the new configuration; the previous SSH configuration was restored"
+  fi
+}
+
+restart_sshd_or_restore() {
+  local stamp="$1"
+  local port="$2"
+
+  if restart_sshd_service && wait_for_ssh_port "$port"; then
+    return 0
+  fi
+  restore_sshd_files "$stamp"
+  restart_sshd_service || true
+  die "SSH did not come back on port $port; the previous SSH configuration was restored"
 }
 
 configure_sshd() {
-  local include_file="/etc/ssh/sshd_config.d/00-login-hardening.conf"
-  local legacy_include_file="/etc/ssh/sshd_config.d/99-login-hardening.conf"
   local sshd_bin
+  local stamp
 
-  cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.bak.$(date +%Y%m%d%H%M%S)"
-  sshd_bin="$(command -v sshd || true)"
-  sshd_bin="${sshd_bin:-/usr/sbin/sshd}"
+  stamp="$(date +%Y%m%d%H%M%S)"
+  sshd_bin="$(sshd_binary)"
+  backup_sshd_files "$stamp"
 
   remove_managed_sshd_block /etc/ssh/sshd_config
   comment_global_sshd_directives /etc/ssh/sshd_config
   if sshd_supports_include "$sshd_bin"; then
     install -d -m 0755 /etc/ssh/sshd_config.d
-    rm -f "$legacy_include_file"
-    print_sshd_hardening_config >"$include_file"
+    rm -f "$SSHD_LEGACY_INCLUDE_FILE"
+    print_sshd_hardening_config >"$SSHD_INCLUDE_FILE"
     ensure_sshd_dropin_include /etc/ssh/sshd_config
   else
     log "warning: this sshd does not support Include; writing SSH hardening inline"
-    rm -f "$include_file" "$legacy_include_file"
+    rm -f "$SSHD_INCLUDE_FILE" "$SSHD_LEGACY_INCLUDE_FILE"
     remove_sshd_dropin_include /etc/ssh/sshd_config
     prepend_inline_sshd_hardening /etc/ssh/sshd_config
   fi
 
-  "$sshd_bin" -t
+  validate_sshd_or_restore "$stamp"
+  allow_ssh_port_in_firewall
 
-  if command -v systemctl >/dev/null 2>&1; then
-    if systemctl list-unit-files | grep -q '^ssh\.socket'; then
-      systemctl disable --now ssh.socket >/dev/null 2>&1 || true
-    fi
+  # Socket activation takes its port from the socket unit and leaves
+  # ssh.service disabled, so sshd would not come back after a reboot.
+  if command -v systemctl >/dev/null 2>&1 && systemctl cat ssh.socket >/dev/null 2>&1; then
+    systemctl disable --now ssh.socket >/dev/null 2>&1 || true
+    systemctl enable ssh.service >/dev/null 2>&1 || log "warning: failed to enable ssh.service"
   fi
 
-  restart_sshd_service
+  restart_sshd_or_restore "$stamp" "$SSH_PORT"
+  if [[ -n "$SSH_TEMP_PORTS" ]]; then
+    log "SSH now listens on $SSH_PORT and, until confirm-ssh, also on: $SSH_TEMP_PORTS"
+  else
+    log "SSH now listens on $SSH_PORT"
+  fi
+}
+
+sshd_temp_block_file() {
+  local file
+
+  for file in "$SSHD_INCLUDE_FILE" /etc/ssh/sshd_config; do
+    if [[ -f "$file" ]] && grep -Fxq "$SSH_TEMP_BEGIN" "$file"; then
+      printf '%s\n' "$file"
+      return 0
+    fi
+  done
+  return 1
+}
+
+sshd_temp_ports_in() {
+  awk -v begin="$SSH_TEMP_BEGIN" -v end="$SSH_TEMP_END" '
+    $0 == begin { inside = 1; next }
+    $0 == end { inside = 0; next }
+    inside && $1 == "Port" { print $2 }
+  ' "$1" | xargs
+}
+
+remove_sshd_temp_block() {
+  local config_file="$1"
+  local tmp_file
+
+  tmp_file="$(mktemp)"
+  awk -v begin="$SSH_TEMP_BEGIN" -v end="$SSH_TEMP_END" '
+    $0 == begin { skip = 1; next }
+    $0 == end { skip = 0; next }
+    !skip { print }
+  ' "$config_file" >"$tmp_file"
+  cat "$tmp_file" >"$config_file"
+  rm -f "$tmp_file"
+}
+
+confirm_ssh() {
+  local connection="${SSH_CONNECTION:-}"
+  local login_port="${connection##* }"
+  local file
+  local ports
+  local port
+  local keep_port
+  local stamp
+
+  [[ "$(id -u)" -eq 0 ]] || die "run as root for confirm-ssh"
+  if ! file="$(sshd_temp_block_file)"; then
+    log "no temporary SSH ports are open; nothing to do"
+    return 0
+  fi
+  ports="$(sshd_temp_ports_in "$file")"
+
+  if [[ -n "$login_port" ]]; then
+    for port in $ports; do
+      [[ "$port" != "$login_port" ]] || die "this session came in through temporary port $port; log in on the new port and run confirm-ssh from there"
+    done
+  else
+    log "warning: no SSH session was detected, so the new port could not be checked"
+    confirm "Close temporary SSH ports: $ports?" || die "aborted"
+  fi
+
+  stamp="$(date +%Y%m%d%H%M%S)"
+  backup_sshd_files "$stamp"
+  remove_sshd_temp_block "$file"
+  validate_sshd_or_restore "$stamp"
+
+  keep_port="$login_port"
+  if [[ -z "$keep_port" ]]; then
+    keep_port="$(sshd_effective_ports | sed -n '1p')"
+  fi
+  restart_sshd_or_restore "$stamp" "$keep_port"
+  log "closed temporary SSH ports: $ports"
+}
+
+tcp_buffer_max_bytes() {
+  if [[ -n "$MANUAL_BUFFER_MIB" ]]; then
+    printf '%s\n' "$MANUAL_BUFFER_BYTES"
+  elif [[ "$ENABLE_BDP_TUNE" == "yes" ]]; then
+    printf '%s\n' "$BDP_BUFFER_BYTES"
+  elif [[ "$SMART_TCP_TUNE" == "yes" ]]; then
+    printf '%s\n' "$SMART_BUFFER_BYTES"
+  fi
+}
+
+# The exit role widens the ephemeral range over common SSH ports. Reserve them
+# so an outgoing connection cannot hold the SSH port when sshd restarts.
+ssh_reserved_ports() {
+  local ports="$SSH_PORT"
+  local reserved
+  local port
+
+  [[ -n "$ports" ]] || ports="$(sshd_effective_ports)"
+  reserved="$(sysctl -n net.ipv4.ip_local_reserved_ports 2>/dev/null || true)"
+  for port in $ports; do
+    (( port >= 10240 )) || continue
+    [[ ",$reserved," == *",$port,"* ]] || reserved="${reserved:+$reserved,}$port"
+  done
+  printf '%s\n' "$reserved"
+}
+
+print_tcp_tune_settings() {
+  local max_bytes
+  local reserved
+
+  if [[ "$ENABLE_BBR_FQ" == "yes" ]]; then
+    printf 'net.core.default_qdisc = fq\n'
+    printf 'net.ipv4.tcp_congestion_control = bbr\n'
+  fi
+
+  max_bytes="$(tcp_buffer_max_bytes)"
+  if [[ -n "$max_bytes" ]]; then
+    printf 'net.core.rmem_max = %s\n' "$max_bytes"
+    printf 'net.core.wmem_max = %s\n' "$max_bytes"
+    printf 'net.ipv4.tcp_rmem = %s %s %s\n' "$TCP_RMEM_MIN" "$TCP_RMEM_DEFAULT" "$max_bytes"
+    printf 'net.ipv4.tcp_wmem = %s %s %s\n' "$TCP_WMEM_MIN" "$TCP_WMEM_DEFAULT" "$max_bytes"
+  fi
+
+  if [[ "$TUNE_ROLE" =~ ^(transit|exit)$ || "$TUNE_OBJECTIVE" =~ ^(single-stream|throughput)$ ]]; then
+    printf 'net.ipv4.tcp_slow_start_after_idle = 0\n'
+  fi
+
+  case "$TUNE_ROLE" in
+    transit|exit)
+      printf 'net.ipv4.tcp_mtu_probing = 1\n'
+      ;;
+    web)
+      printf 'net.core.somaxconn = 8192\n'
+      printf 'net.ipv4.tcp_max_syn_backlog = 8192\n'
+      printf 'net.ipv4.tcp_mtu_probing = 1\n'
+      ;;
+  esac
+
+  if [[ "$TUNE_ROLE" == "exit" ]]; then
+    printf 'net.ipv4.ip_local_port_range = 10240 65535\n'
+    reserved="$(ssh_reserved_ports)"
+    if [[ -n "$reserved" ]]; then
+      printf 'net.ipv4.ip_local_reserved_ports = %s\n' "$reserved"
+    fi
+  fi
 }
 
 print_tcp_tune_sysctl() {
@@ -1247,53 +1487,18 @@ print_tcp_tune_sysctl() {
   else
     printf '# Conservative TCP profile: role=%s; keep system-managed buffers\n' "$TUNE_ROLE"
   fi
-
-  if [[ "$ENABLE_BBR_FQ" == "yes" ]]; then
-    printf 'net.core.default_qdisc = fq\n'
-    printf 'net.ipv4.tcp_congestion_control = bbr\n'
-  fi
-
-  if [[ -n "$MANUAL_BUFFER_MIB" ]]; then
-    printf 'net.core.rmem_max = %s\n' "$MANUAL_BUFFER_BYTES"
-    printf 'net.core.wmem_max = %s\n' "$MANUAL_BUFFER_BYTES"
-    printf 'net.ipv4.tcp_rmem = %s %s %s\n' "$TCP_RMEM_MIN" "$TCP_RMEM_DEFAULT" "$MANUAL_BUFFER_BYTES"
-    printf 'net.ipv4.tcp_wmem = %s %s %s\n' "$TCP_WMEM_MIN" "$TCP_WMEM_DEFAULT" "$MANUAL_BUFFER_BYTES"
-  elif [[ "$ENABLE_BDP_TUNE" == "yes" ]]; then
-    printf 'net.core.rmem_max = %s\n' "$BDP_BUFFER_BYTES"
-    printf 'net.core.wmem_max = %s\n' "$BDP_BUFFER_BYTES"
-    printf 'net.ipv4.tcp_rmem = %s %s %s\n' "$TCP_RMEM_MIN" "$TCP_RMEM_DEFAULT" "$BDP_BUFFER_BYTES"
-    printf 'net.ipv4.tcp_wmem = %s %s %s\n' "$TCP_WMEM_MIN" "$TCP_WMEM_DEFAULT" "$BDP_BUFFER_BYTES"
-  elif [[ "$SMART_TCP_TUNE" == "yes" ]]; then
-    printf 'net.core.rmem_max = %s\n' "$SMART_BUFFER_BYTES"
-    printf 'net.core.wmem_max = %s\n' "$SMART_BUFFER_BYTES"
-    printf 'net.ipv4.tcp_rmem = %s %s %s\n' "$TCP_RMEM_MIN" "$TCP_RMEM_DEFAULT" "$SMART_BUFFER_BYTES"
-    printf 'net.ipv4.tcp_wmem = %s %s %s\n' "$TCP_WMEM_MIN" "$TCP_WMEM_DEFAULT" "$SMART_BUFFER_BYTES"
-  fi
-
-  case "$TUNE_ROLE" in
-    transit|exit)
-      printf 'net.ipv4.tcp_slow_start_after_idle = 0\n'
-      printf 'net.ipv4.tcp_mtu_probing = 1\n'
-      ;;
-    web)
-      printf 'net.core.somaxconn = 8192\n'
-      printf 'net.ipv4.tcp_max_syn_backlog = 8192\n'
-      printf 'net.ipv4.tcp_mtu_probing = 1\n'
-      ;;
-  esac
-
-  if [[ "$TUNE_ROLE" == "exit" ]]; then
-    printf 'net.ipv4.ip_local_port_range = 10240 65535\n'
-  fi
+  print_tcp_tune_settings
 }
 
-print_fq_restore_files() {
-  cat <<'FQ_RESTORE_SCRIPT'
-/etc/default/vps-fq-restore:
+print_fq_restore_default() {
+  cat <<'FQ_DEFAULT'
 # Space-separated interface names. Leave empty to use default route interfaces.
 VPS_FQ_IFACES=
+FQ_DEFAULT
+}
 
-/usr/local/sbin/vps-fq-restore:
+print_fq_restore_script() {
+  cat <<'FQ_SCRIPT'
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -1317,8 +1522,11 @@ for iface in $VPS_FQ_IFACES; do
   esac
   tc qdisc replace dev "$iface" root fq >/dev/null 2>&1 || true
 done
+FQ_SCRIPT
+}
 
-/etc/systemd/system/vps-fq-restore.service:
+print_fq_restore_unit() {
+  cat <<'FQ_SERVICE'
 [Unit]
 Description=Restore fq queue discipline for VPS TCP tuning
 After=network-online.target
@@ -1330,7 +1538,16 @@ ExecStart=/usr/local/sbin/vps-fq-restore
 
 [Install]
 WantedBy=multi-user.target
-FQ_RESTORE_SCRIPT
+FQ_SERVICE
+}
+
+print_fq_restore_files() {
+  printf '/etc/default/vps-fq-restore:\n'
+  print_fq_restore_default
+  printf '\n/usr/local/sbin/vps-fq-restore:\n'
+  print_fq_restore_script
+  printf '\n/etc/systemd/system/vps-fq-restore.service:\n'
+  print_fq_restore_unit
 }
 
 apply_sysctl_setting() {
@@ -1390,6 +1607,23 @@ warn_sysctl_network_overrides() {
   done
 }
 
+managed_network_paths() {
+  printf '%s\n' \
+    /etc/sysctl.d/90-vps-bbr-fq.conf \
+    /etc/sysctl.d/99-vps-tcp-tune.conf \
+    /etc/sysctl.d/99-joeyblog.conf \
+    /etc/sysctl.d/98-vps-baseline.conf \
+    /etc/sysctl.d/99-bbr-fq.conf \
+    /etc/modules-load.d/bbr.conf \
+    /etc/gai.conf \
+    /etc/default/vps-fq-restore \
+    /usr/local/sbin/vps-fq-restore \
+    /etc/systemd/system/vps-fq-restore.service \
+    /etc/default/vps-tc-shape \
+    /usr/local/sbin/vps-tc-shape \
+    /etc/systemd/system/vps-tc-shape.service
+}
+
 network_backup_config() {
   local backup_dir
   local path
@@ -1401,26 +1635,14 @@ network_backup_config() {
   if [[ "$NETWORK_BACKUP_DONE" == "yes" ]]; then
     return 0
   fi
-  [[ "$BBRV3_BACKUP_ROOT" == /* && "$BBRV3_BACKUP_ROOT" != "/" ]] || die "BBRV3_BACKUP_ROOT must be a non-root absolute path"
+  [[ "$BACKUP_ROOT" == /* && "$BACKUP_ROOT" != "/" ]] || die "BACKUP_ROOT must be a non-root absolute path"
 
-  backup_dir="${BBRV3_BACKUP_ROOT}/$(date +%Y%m%d%H%M%S)-$$-network"
+  backup_dir="${BACKUP_ROOT}/$(date +%Y%m%d%H%M%S)-$$-network"
   manifest="$backup_dir/manifest.tsv"
   install -d -m 0700 "$backup_dir/files"
   : >"$manifest"
 
-  for path in \
-    /etc/sysctl.d/90-vps-bbr-fq.conf \
-    /etc/sysctl.d/99-vps-tcp-tune.conf \
-    /etc/sysctl.d/99-joeyblog.conf \
-    /etc/sysctl.d/98-vps-baseline.conf \
-    /etc/sysctl.d/99-bbr-fq.conf \
-    /etc/gai.conf \
-    /etc/default/vps-fq-restore \
-    /usr/local/sbin/vps-fq-restore \
-    /etc/systemd/system/vps-fq-restore.service \
-    /etc/default/vps-tc-shape \
-    /usr/local/sbin/vps-tc-shape \
-    /etc/systemd/system/vps-tc-shape.service; do
+  while IFS= read -r path; do
     if [[ -e "$path" || -L "$path" ]]; then
       relative="${path#/}"
       install -d -m 0700 "$backup_dir/files/$(dirname "$relative")"
@@ -1429,7 +1651,7 @@ network_backup_config() {
     else
       printf 'absent\t%s\n' "$path" >>"$manifest"
     fi
-  done
+  done < <(managed_network_paths)
 
   : >"$backup_dir/services.tsv"
   if command -v systemctl >/dev/null 2>&1; then
@@ -1451,16 +1673,7 @@ network_backup_config() {
 }
 
 network_backup_path_allowed() {
-  case "$1" in
-    /etc/sysctl.d/90-vps-bbr-fq.conf|/etc/sysctl.d/99-vps-tcp-tune.conf|\
-    /etc/sysctl.d/99-joeyblog.conf|/etc/sysctl.d/98-vps-baseline.conf|/etc/sysctl.d/99-bbr-fq.conf|\
-    /etc/gai.conf|\
-    /etc/default/vps-fq-restore|/usr/local/sbin/vps-fq-restore|/etc/systemd/system/vps-fq-restore.service|\
-    /etc/default/vps-tc-shape|/usr/local/sbin/vps-tc-shape|/etc/systemd/system/vps-tc-shape.service)
-      return 0
-      ;;
-  esac
-  return 1
+  [[ $'\n'"$(managed_network_paths)"$'\n' == *$'\n'"$1"$'\n'* ]]
 }
 
 network_created_path_allowed() {
@@ -1469,13 +1682,13 @@ network_created_path_allowed() {
 
 latest_network_backup() {
   local pointed
-  [[ "$BBRV3_BACKUP_ROOT" == /* && "$BBRV3_BACKUP_ROOT" != "/" ]] || die "BBRV3_BACKUP_ROOT must be a non-root absolute path"
+  [[ "$BACKUP_ROOT" == /* && "$BACKUP_ROOT" != "/" ]] || die "BACKUP_ROOT must be a non-root absolute path"
   pointed="$(sed -n '1p' /etc/vps-firstboot-last-network-backup 2>/dev/null || true)"
-  if [[ "$pointed" == "${BBRV3_BACKUP_ROOT}/"*-network && -f "$pointed/manifest.tsv" ]]; then
+  if [[ "$pointed" == "${BACKUP_ROOT}/"*-network && -f "$pointed/manifest.tsv" ]]; then
     printf '%s\n' "$pointed"
     return 0
   fi
-  ls -dt "${BBRV3_BACKUP_ROOT}"/*-network 2>/dev/null | head -n 1 || true
+  ls -dt "${BACKUP_ROOT}"/*-network 2>/dev/null | head -n 1 || true
 }
 
 network_rollback() {
@@ -1598,51 +1811,10 @@ install_fq_restore_service() {
   fi
 
   install -d -m 0755 /etc/default /usr/local/sbin
-  cat >"$default_file" <<'FQ_DEFAULT'
-# Space-separated interface names. Leave empty to use default route interfaces.
-VPS_FQ_IFACES=
-FQ_DEFAULT
-
-  cat >"$script_file" <<'FQ_SCRIPT'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-if [[ -f /etc/default/vps-fq-restore ]]; then
-  . /etc/default/vps-fq-restore
-fi
-
-sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
-
-if [[ -z "${VPS_FQ_IFACES:-}" ]]; then
-  VPS_FQ_IFACES="$(ip route show default 2>/dev/null | awk '{print $5}' | sort -u | tr '\n' ' ')"
-fi
-
-for iface in $VPS_FQ_IFACES; do
-  [[ "$iface" == "lo" ]] && continue
-  ip link show dev "$iface" >/dev/null 2>&1 || continue
-  root_qdisc="$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1 {print $2}')"
-  case "$root_qdisc" in
-    pfifo|pfifo_fast|bfifo|fq_codel) ;;
-    *) continue ;;
-  esac
-  tc qdisc replace dev "$iface" root fq >/dev/null 2>&1 || true
-done
-FQ_SCRIPT
+  print_fq_restore_default >"$default_file"
+  print_fq_restore_script >"$script_file"
   chmod 0755 "$script_file"
-
-  cat >"$service_file" <<'FQ_SERVICE'
-[Unit]
-Description=Restore fq queue discipline for VPS TCP tuning
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/vps-fq-restore
-
-[Install]
-WantedBy=multi-user.target
-FQ_SERVICE
+  print_fq_restore_unit >"$service_file"
 
   "$script_file"
   systemctl daemon-reload || log "warning: failed to reload systemd after writing vps-fq-restore.service"
@@ -1651,17 +1823,23 @@ FQ_SERVICE
 
 configure_tcp_tune() {
   local available
+  local line
+  local key
+  local value
   local sysctl_file="/etc/sysctl.d/90-vps-bbr-fq.conf"
 
-  if [[ "$ENABLE_BBR_FQ" != "yes" && "$ENABLE_VPS_SYSCTL" != "yes" && "$ENABLE_BDP_TUNE" != "yes" && "$SMART_TCP_TUNE" != "yes" && -z "$MANUAL_BUFFER_MIB" && "$TUNE_ROLE" == "general" ]]; then
+  if [[ "$ENABLE_BBR_FQ" != "yes" && "$ENABLE_BDP_TUNE" != "yes" && "$SMART_TCP_TUNE" != "yes" && -z "$MANUAL_BUFFER_MIB" && "$TUNE_ROLE" == "general" ]]; then
     disable_legacy_tcp_tune_conf
     warn_sysctl_network_overrides
-    NETWORK_TUNE_APPLIED="yes"
     return 0
   fi
 
-  if [[ "$ENABLE_BBR_FQ" == "yes" && -x "$(command -v modprobe || true)" ]]; then
-    modprobe tcp_bbr 2>/dev/null || true
+  if [[ "$ENABLE_BBR_FQ" == "yes" ]]; then
+    if [[ -x "$(command -v modprobe || true)" ]]; then
+      modprobe tcp_bbr 2>/dev/null || true
+    fi
+    install -d -m 0755 /etc/modules-load.d
+    printf 'tcp_bbr\n' >/etc/modules-load.d/bbr.conf
   fi
 
   available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
@@ -1671,54 +1849,15 @@ configure_tcp_tune() {
   rm -f /etc/sysctl.d/98-vps-baseline.conf /etc/sysctl.d/99-bbr-fq.conf
   : >"$sysctl_file"
 
-  if [[ "$ENABLE_BBR_FQ" == "yes" ]]; then
-    apply_sysctl_setting "$sysctl_file" net.core.default_qdisc fq
-    if [[ " $available " == *" bbr "* ]]; then
-      apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_congestion_control bbr
-    elif [[ "$ENABLE_BBRV3_KERNEL" == "yes" ]]; then
-      apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_congestion_control bbr
-      log "BBR is unavailable on the running kernel; persisted bbr for the newly installed kernel"
-    else
-      log "warning: tcp_bbr is not available on this kernel; skipping tcp_congestion_control=bbr"
+  while IFS= read -r line; do
+    key="${line%% = *}"
+    value="${line#* = }"
+    if [[ "$key" == "net.ipv4.tcp_congestion_control" && " $available " != *" bbr "* ]]; then
+      log "warning: tcp_bbr is not available on this kernel; tcp_congestion_control was left unchanged"
+      continue
     fi
-  fi
-
-  if [[ -n "$MANUAL_BUFFER_MIB" ]]; then
-    apply_sysctl_setting "$sysctl_file" net.core.rmem_max "$MANUAL_BUFFER_BYTES"
-    apply_sysctl_setting "$sysctl_file" net.core.wmem_max "$MANUAL_BUFFER_BYTES"
-    apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_rmem "$TCP_RMEM_MIN $TCP_RMEM_DEFAULT $MANUAL_BUFFER_BYTES"
-    apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_wmem "$TCP_WMEM_MIN $TCP_WMEM_DEFAULT $MANUAL_BUFFER_BYTES"
-  elif [[ "$ENABLE_BDP_TUNE" == "yes" ]]; then
-    apply_sysctl_setting "$sysctl_file" net.core.rmem_max "$BDP_BUFFER_BYTES"
-    apply_sysctl_setting "$sysctl_file" net.core.wmem_max "$BDP_BUFFER_BYTES"
-    apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_rmem "$TCP_RMEM_MIN $TCP_RMEM_DEFAULT $BDP_BUFFER_BYTES"
-    apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_wmem "$TCP_WMEM_MIN $TCP_WMEM_DEFAULT $BDP_BUFFER_BYTES"
-  elif [[ "$SMART_TCP_TUNE" == "yes" ]]; then
-    apply_sysctl_setting "$sysctl_file" net.core.rmem_max "$SMART_BUFFER_BYTES"
-    apply_sysctl_setting "$sysctl_file" net.core.wmem_max "$SMART_BUFFER_BYTES"
-    apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_rmem "$TCP_RMEM_MIN $TCP_RMEM_DEFAULT $SMART_BUFFER_BYTES"
-    apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_wmem "$TCP_WMEM_MIN $TCP_WMEM_DEFAULT $SMART_BUFFER_BYTES"
-  fi
-
-  case "$TUNE_ROLE" in
-    transit|exit)
-      apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_slow_start_after_idle 0
-      apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_mtu_probing 1
-      ;;
-    web)
-      apply_sysctl_setting "$sysctl_file" net.core.somaxconn 8192
-      apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_max_syn_backlog 8192
-      apply_sysctl_setting "$sysctl_file" net.ipv4.tcp_mtu_probing 1
-      ;;
-  esac
-
-  if [[ "$TUNE_ROLE" == "exit" ]]; then
-    apply_sysctl_setting "$sysctl_file" net.ipv4.ip_local_port_range "10240 65535"
-  fi
-
-  if [[ "$ENABLE_VPS_SYSCTL" == "yes" ]]; then
-    log "notice: --enable-vps-sysctl is deprecated; aggressive TCP buffer/backlog tuning is no longer written"
-  fi
+    apply_sysctl_setting "$sysctl_file" "$key" "$value"
+  done < <(print_tcp_tune_settings)
 
   if [[ ! -s "$sysctl_file" ]]; then
     rm -f "$sysctl_file"
@@ -1726,7 +1865,6 @@ configure_tcp_tune() {
 
   warn_sysctl_network_overrides
   install_fq_restore_service
-  NETWORK_TUNE_APPLIED="yes"
 }
 
 configure_tc_shaping() {
@@ -1790,6 +1928,122 @@ TC_SERVICE
   fi
 }
 
+apt_get() {
+  DEBIAN_FRONTEND=noninteractive apt-get -y \
+    -o DPkg::Lock::Timeout=300 \
+    -o Dpkg::Options::=--force-confdef \
+    -o Dpkg::Options::=--force-confold \
+    "$@" </dev/null
+}
+
+# apt-get update takes the lists lock without waiting, and apt-daily can hold it.
+apt_update() {
+  local attempt
+
+  for attempt in 1 2 3; do
+    apt_get update && return 0
+    log "apt-get update failed (attempt $attempt of 3)"
+    sleep 20
+  done
+  return 1
+}
+
+wait_for_boot_tasks() {
+  command -v cloud-init >/dev/null 2>&1 || return 0
+  log "waiting for cloud-init to finish"
+  timeout 600 cloud-init status --wait >/dev/null 2>&1 || log "warning: cloud-init reported a problem or timed out; continuing"
+}
+
+os_release_value() {
+  awk -F= -v key="$1" '$1 == key {gsub(/"/, "", $2); print $2; exit}' /etc/os-release 2>/dev/null || true
+}
+
+ensure_debian_security_source() {
+  local codename
+  local policy
+
+  [[ "$(os_release_value ID)" == "debian" ]] || return 0
+  codename="$(os_release_value VERSION_CODENAME)"
+  case "$codename" in
+    bookworm|trixie) ;;
+    *) return 0 ;;
+  esac
+
+  policy="$(apt-cache policy 2>/dev/null || true)"
+  [[ "$policy" != *"n=${codename}-security"* ]] || return 0
+
+  log "adding the missing ${codename}-security source"
+  cat >/etc/apt/sources.list.d/debian-security.sources <<SOURCES
+Types: deb
+URIs: http://security.debian.org/debian-security
+Suites: ${codename}-security
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+SOURCES
+  apt_update
+}
+
+# Without the metapackage, apt never pulls in new Debian kernels.
+ensure_debian_kernel_metapackage() {
+  local arch
+  local meta
+  local status
+
+  [[ "$(os_release_value ID)" == "debian" ]] || return 0
+  if command -v systemd-detect-virt >/dev/null 2>&1 && systemd-detect-virt -cq; then
+    return 0
+  fi
+
+  arch="$(dpkg --print-architecture)"
+  case "$(uname -r)" in
+    *-cloud-*) meta="linux-image-cloud-$arch" ;;
+    *) meta="linux-image-$arch" ;;
+  esac
+
+  status="$(dpkg-query -W -f='${db:Status-Status}' "$meta" 2>/dev/null || true)"
+  [[ "$status" != "installed" ]] || return 0
+  log "installing the kernel metapackage $meta"
+  apt_get install "$meta"
+}
+
+enable_automatic_security_updates() {
+  apt_get install unattended-upgrades || return 1
+  cat >/etc/apt/apt.conf.d/20auto-upgrades <<'AUTO_UPGRADES'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+AUTO_UPGRADES
+}
+
+apply_system_update() {
+  DEBIAN_FRONTEND=noninteractive dpkg --force-confdef --force-confold --configure -a </dev/null || return 1
+  apt_update || return 1
+  ensure_debian_security_source || return 1
+  apt_get -f install || return 1
+  apt_get full-upgrade || return 1
+  ensure_debian_kernel_metapackage || return 1
+  enable_automatic_security_updates
+}
+
+system_update() {
+  if [[ "$ENABLE_SYSTEM_UPDATE" != "yes" ]]; then
+    SYSTEM_UPDATE_RESULT="disabled"
+    return 0
+  fi
+  if ! command -v apt-get >/dev/null 2>&1; then
+    SYSTEM_UPDATE_RESULT="unsupported"
+    log "warning: system update supports apt only; skipping"
+    return 0
+  fi
+
+  log "installing system updates"
+  if apply_system_update; then
+    SYSTEM_UPDATE_RESULT="ok"
+  else
+    SYSTEM_UPDATE_RESULT="failed"
+    log "warning: system update failed; continuing with the remaining setup"
+  fi
+}
+
 install_fail2ban() {
   local fail2ban_backend="auto"
 
@@ -1798,9 +2052,8 @@ install_fail2ban() {
   fi
 
   if command -v apt-get >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y fail2ban
+    apt_update || return 1
+    apt_get install fail2ban || return 1
   elif command -v dnf >/dev/null 2>&1; then
     dnf install -y fail2ban
   elif command -v yum >/dev/null 2>&1; then
@@ -1842,13 +2095,14 @@ configure_locale() {
   fi
 
   if command -v apt-get >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
     if ! command -v locale-gen >/dev/null 2>&1; then
-      apt-get update
-      apt-get install -y locales
+      if ! { apt_update && apt_get install locales; }; then
+        log "warning: failed to install locales; skipping locale configuration"
+        return 0
+      fi
     fi
 
-    if [[ -f /etc/locale.gen ]] && ! grep -Eq "^[[:space:]]*$SYSTEM_LOCALE[[:space:]]+UTF-8" /etc/locale.gen; then
+    if [[ -f /etc/locale.gen ]] && ! grep -Eq "^[[:space:]]*${SYSTEM_LOCALE}[[:space:]]+UTF-8" /etc/locale.gen; then
       printf '%s UTF-8\n' "$SYSTEM_LOCALE" >>/etc/locale.gen
     fi
 
@@ -1925,489 +2179,10 @@ configure_ipv4_preference() {
   rm -f "$tmp_file"
 }
 
-bbrv3_arch_tag() {
-  case "$(uname -m)" in
-    x86_64|amd64)
-      printf '%s\n' x86_64
-      ;;
-    aarch64|arm64)
-      printf '%s\n' arm64
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-}
-
-bbrv3_os_supported() {
-  local id=""
-  local version_id=""
-  local major=""
-
-  [[ -r /etc/os-release ]] || return 1
-  . /etc/os-release
-  id="${ID:-}"
-  version_id="${VERSION_ID:-}"
-  major="${version_id%%.*}"
-
-  case "$id:$major" in
-    debian:12|debian:13|ubuntu:24|ubuntu:25|ubuntu:26)
-      return 0
-      ;;
-  esac
-
-  case "${VERSION_CODENAME:-}" in
-    bookworm|trixie|forky|sid|noble|oracular|plucky|questing)
-      return 0
-      ;;
-  esac
-
-  return 1
-}
-
-bbrv3_ensure_deps() {
-  command -v apt-get >/dev/null 2>&1 || die "BBRv3 kernel install requires Debian/Ubuntu with apt-get"
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update
-  apt-get install -y ca-certificates curl jq dpkg coreutils sed grep
-}
-
-bbrv3_gh_api() {
-  local url="$1"
-  local token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
-  if [[ -n "$token" ]]; then
-    [[ "$token" =~ ^[A-Za-z0-9_]+$ ]] || die "GITHUB_TOKEN/GH_TOKEN contains unsupported characters"
-    # Read the authorization header from stdin so the token is not exposed in
-    # curl's process arguments or ordinary command diagnostics.
-    curl -fsSL --config - "$url" <<CURL_CONFIG
-header = "Authorization: Bearer $token"
-header = "Accept: application/vnd.github+json"
-CURL_CONFIG
-  else
-    curl -fsSL -H "Accept: application/vnd.github+json" "$url"
-  fi
-}
-
-bbrv3_locked_tag() {
-  local tag=""
-  if [[ -r "$BBRV3_LOCK_FILE" ]]; then
-    tag="$(sed -n '1p' "$BBRV3_LOCK_FILE")"
-    [[ -n "$tag" ]] || return 1
-    printf '%s\n' "$tag"
-    return 0
-  fi
-  return 1
-}
-
-bbrv3_select_tag() {
-  local arch="$1"
-  local releases_json
-  local tag_pattern
-  local locked
-
-  if [[ -n "$BBRV3_VERSION" && "$BBRV3_VERSION" != "latest" ]]; then
-    printf '%s\n' "$BBRV3_VERSION"
-    return 0
-  fi
-
-  if [[ -z "$BBRV3_VERSION" ]]; then
-    locked="$(bbrv3_locked_tag || true)"
-    if [[ -n "$locked" ]]; then
-      printf '%s\n' "$locked"
-      return 0
-    fi
-  fi
-
-  releases_json="$(bbrv3_gh_api "https://api.github.com/repos/${BBRV3_REPO}/releases?per_page=50")"
-  if [[ "$BBRV3_FLAVOR" == "max" ]]; then
-    tag_pattern="^${arch}-[0-9].*-max$"
-  else
-    tag_pattern="^${arch}-[0-9].*[^x]$"
-  fi
-
-  printf '%s\n' "$releases_json" |
-    jq -r --arg pattern "$tag_pattern" '[.[] | select(.tag_name | test($pattern))][0].tag_name // empty'
-}
-
-bbrv3_release_json() {
-  local tag="$1"
-  bbrv3_gh_api "https://api.github.com/repos/${BBRV3_REPO}/releases/tags/${tag}"
-}
-
-bbrv3_download_assets() {
-  local release_json="$1"
-  local dest_dir="$2"
-  local assets
-  local url
-  local name
-  local digest
-  local size
-  local expected_hash
-  local actual_hash
-  local actual_size
-  local package
-  local architecture
-  local part_file
-
-  install -d -m 0755 "$dest_dir"
-  assets="$(printf '%s\n' "$release_json" | jq -r '
-    .assets[]
-    | select(.name | test("\\.deb$"))
-    | select(.name | test("linux-(image|headers)"))
-    | select(.name | test("dbg|debug") | not)
-    | [.name, .browser_download_url, (.digest // ""), (.size | tostring)]
-    | @tsv
-  ')"
-  [[ -n "$assets" ]] || die "no linux image/header .deb assets found in BBRv3 release $BBRV3_SELECTED_TAG"
-
-  : >"$dest_dir/assets.tsv"
-  while IFS=$'\t' read -r name url digest size; do
-    [[ "$name" =~ ^[A-Za-z0-9._+-]+\.deb$ ]] || die "release contains an unsafe asset name"
-    [[ "$url" == "https://github.com/${BBRV3_REPO}/releases/download/"* ]] || die "release contains an unexpected asset URL for $name"
-    [[ "$size" =~ ^[0-9]+$ ]] && (( size > 0 )) || die "release contains an invalid asset size for $name"
-    [[ "$digest" =~ ^sha256:[0-9a-fA-F]{64}$ ]] || die "release asset $name has no usable GitHub SHA-256 digest"
-    expected_hash="${digest#sha256:}"
-    expected_hash="${expected_hash,,}"
-    part_file="$dest_dir/$name.part"
-    log "downloading $name"
-    curl -fL "$url" -o "$part_file"
-    actual_size="$(wc -c <"$part_file" | tr -d '[:space:]')"
-    [[ "$actual_size" == "$size" ]] || die "size verification failed for $name"
-    actual_hash="$(sha256sum "$part_file" | awk '{print $1}')"
-    [[ "$actual_hash" == "$expected_hash" ]] || die "SHA-256 verification failed for $name"
-
-    package="$(dpkg-deb -f "$part_file" Package 2>/dev/null || true)"
-    architecture="$(dpkg-deb -f "$part_file" Architecture 2>/dev/null || true)"
-    [[ "$package" =~ ^linux-(image|headers)-[A-Za-z0-9.+~_-]+$ ]] || die "unexpected Debian package name in $name"
-    [[ "$architecture" =~ ^(amd64|arm64|all)$ ]] || die "unexpected Debian package architecture in $name"
-    mv "$part_file" "$dest_dir/$name"
-    printf '%s\t%s\t%s\t%s\n' "$name" "$package" "$architecture" "$digest" >>"$dest_dir/assets.tsv"
-  done <<EOF
-$assets
-EOF
-}
-
-bbrv3_write_package_manifest() {
-  local work_dir="$1"
-  local state_dir="$BBRV3_STATE_ROOT/$BBRV3_SELECTED_TAG"
-  local manifest="$state_dir/packages.tsv"
-  local deb
-  local package
-  local version
-  local architecture
-
-  install -d -m 0700 "$state_dir"
-  : >"$manifest"
-  for deb in "$work_dir"/*.deb; do
-    [[ -f "$deb" ]] || continue
-    package="$(dpkg-deb -f "$deb" Package)"
-    version="$(dpkg-deb -f "$deb" Version)"
-    architecture="$(dpkg-deb -f "$deb" Architecture)"
-    [[ "$package" =~ ^linux-(image|headers)-[A-Za-z0-9.+~_-]+$ ]] || die "refusing to record unexpected kernel package: $package"
-    [[ "$version" =~ ^[A-Za-z0-9.+:~_-]+$ ]] || die "refusing to record an invalid package version"
-    printf '%s\t%s\t%s\t%s\n' "$package" "$version" "$architecture" "$(basename "$deb")" >>"$manifest"
-  done
-  [[ -s "$manifest" ]] || die "no verified BBRv3 packages were available to install"
-  chmod 0600 "$manifest"
-}
-
-bbrv3_verify_manifest_installed() {
-  local manifest="$BBRV3_STATE_ROOT/$BBRV3_SELECTED_TAG/packages.tsv"
-  local package
-  local expected_version
-  local installed_version
-  local status
-  local _architecture
-  local _asset
-
-  [[ -f "$manifest" ]] || die "BBRv3 package manifest is missing after installation"
-  while IFS=$'\t' read -r package expected_version _architecture _asset; do
-    status="$(dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null || true)"
-    installed_version="$(dpkg-query -W -f='${Version}' "$package" 2>/dev/null || true)"
-    [[ "$status" == "ii " ]] || die "BBRv3 package did not finish installing: $package"
-    [[ "$installed_version" == "$expected_version" ]] || die "installed version mismatch for $package"
-  done <"$manifest"
-}
-
-bbrv3_backup_sysctl() {
-  local backup_dir
-  local manifest
-  local path
-  local relative
-  if [[ "$BBRV3_BACKUP_DONE" == "yes" ]]; then
-    return 0
-  fi
-  [[ "$BBRV3_BACKUP_ROOT" == /* && "$BBRV3_BACKUP_ROOT" != "/" ]] || die "BBRV3_BACKUP_ROOT must be a non-root absolute path"
-  backup_dir="${BBRV3_BACKUP_ROOT}/$(date +%Y%m%d%H%M%S)-$$-bbrv3"
-  manifest="$backup_dir/manifest.tsv"
-  install -d -m 0700 "$backup_dir/files"
-  : >"$manifest"
-  for path in \
-    /etc/sysctl.d/90-vps-bbr-fq.conf \
-    /etc/sysctl.d/99-vps-tcp-tune.conf \
-    /etc/sysctl.d/99-joeyblog.conf \
-    /etc/sysctl.d/98-vps-baseline.conf \
-    /etc/sysctl.d/99-bbr-fq.conf; do
-    if [[ -e "$path" || -L "$path" ]]; then
-      relative="${path#/}"
-      install -d -m 0700 "$backup_dir/files/$(dirname "$relative")"
-      cp -a "$path" "$backup_dir/files/$relative"
-      printf 'present\t%s\n' "$path" >>"$manifest"
-    else
-      printf 'absent\t%s\n' "$path" >>"$manifest"
-    fi
-  done
-  printf '%s\n' "$backup_dir" >/etc/vps-firstboot-last-sysctl-backup 2>/dev/null || true
-  BBRV3_BACKUP_DONE="yes"
-  log "backed up sysctl config to $backup_dir"
-}
-
-bbrv3_disable_aggressive_sysctl_files() {
-  disable_legacy_tcp_tune_conf
-}
-
-bbrv3_apply_fq_sysctl() {
-  if [[ "$NETWORK_TUNE_APPLIED" == "yes" ]]; then
-    log "keeping the TCP role/profile already applied during setup"
-    return 0
-  fi
-  ENABLE_BBR_FQ="yes"
-  ENABLE_BDP_TUNE="no"
-  SMART_TCP_TUNE="no"
-  TUNE_ROLE="general"
-  ENABLE_VPS_SYSCTL="no"
-  configure_tcp_tune
-}
-
-bbrv3_install() {
-  local arch
-  local release_json
-  local work_dir
-  local current_kernel
-
-  [[ "$(id -u)" -eq 0 ]] || die "run as root for BBRv3 install"
-  bbrv3_os_supported || die "BBRv3 install supports Debian 12/13 or Ubuntu 24.04+ only"
-  arch="$(bbrv3_arch_tag)" || die "BBRv3 install supports x86_64 and aarch64 only"
-  [[ "$BBRV3_REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "--bbrv3-repo must be OWNER/REPO"
-  [[ "$BBRV3_FLAVOR" =~ ^(standard|max)$ ]] || die "BBRV3_FLAVOR must be standard or max"
-
-  bbrv3_ensure_deps
-  install -d -m 0755 "$(dirname "$BBRV3_LOCK_FILE")" "$BBRV3_INSTALL_DIR"
-
-  BBRV3_SELECTED_TAG="$(bbrv3_select_tag "$arch")"
-  [[ -n "$BBRV3_SELECTED_TAG" ]] || die "could not select a BBRv3 release tag"
-  [[ "$BBRV3_SELECTED_TAG" =~ ^[A-Za-z0-9._+-]+$ ]] || die "selected BBRv3 tag contains unsupported characters"
-  [[ "$BBRV3_SELECTED_TAG" == "$arch-"* ]] || die "selected BBRv3 tag does not match architecture $arch"
-  [[ "$BBRV3_INSTALL_DIR" == /* && "$BBRV3_INSTALL_DIR" != "/" ]] || die "BBRV3_INSTALL_DIR must be a non-root absolute path"
-  [[ "$BBRV3_STATE_ROOT" == /* && "$BBRV3_STATE_ROOT" != "/" ]] || die "BBRV3_STATE_ROOT must be a non-root absolute path"
-  if [[ "$BBRV3_FLAVOR" == "standard" && "$BBRV3_SELECTED_TAG" == *-max ]]; then
-    die "selected tag is a max kernel but standard flavor was requested: $BBRV3_SELECTED_TAG"
-  fi
-
-  current_kernel="$(uname -r)"
-  work_dir="${BBRV3_INSTALL_DIR}/${BBRV3_SELECTED_TAG}-$$"
-  release_json="$(bbrv3_release_json "$BBRV3_SELECTED_TAG")"
-
-  cat <<PLAN
-
-BBRv3 install plan:
-  repo:           $BBRV3_REPO
-  tag:            $BBRV3_SELECTED_TAG
-  flavor:         $BBRV3_FLAVOR
-  arch:           $arch
-  current kernel: $current_kernel
-  reboot:         no automatic reboot
-  rollback:       old kernel packages are kept as boot fallback
-
-PLAN
-  confirm "Proceed with BBRv3 kernel install?" || die "aborted"
-
-  bbrv3_backup_sysctl
-  bbrv3_disable_aggressive_sysctl_files
-  bbrv3_download_assets "$release_json" "$work_dir"
-  bbrv3_write_package_manifest "$work_dir"
-
-  log "installing BBRv3 kernel packages"
-  dpkg -i "$work_dir"/*.deb || apt-get -f install -y
-  bbrv3_verify_manifest_installed
-  update-initramfs -u -k all >/dev/null 2>&1 || true
-  if command -v update-grub >/dev/null 2>&1; then
-    update-grub >/dev/null 2>&1 || log "warning: update-grub failed"
-  elif command -v grub-mkconfig >/dev/null 2>&1; then
-    grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1 || log "warning: grub-mkconfig failed"
-  fi
-
-  bbrv3_apply_fq_sysctl
-
-  if [[ "$BBRV3_LOCK_VERSION" == "yes" ]]; then
-    printf '%s\n' "$BBRV3_SELECTED_TAG" >"$BBRV3_LOCK_FILE"
-    log "locked BBRv3 release tag: $BBRV3_LOCK_FILE -> $BBRV3_SELECTED_TAG"
-  fi
-
-  BBRV3_NEEDS_REBOOT="yes"
-  bbrv3_check
-  cat <<DONE
-
-BBRv3 kernel packages installed.
-No reboot was performed. Reboot during your maintenance window:
-  reboot
-
-After reboot, verify:
-  bash /root/vps-firstboot.sh check
-
-DONE
-}
-
-bbrv3_module_version() {
-  modinfo tcp_bbr 2>/dev/null | awk -F': *' '/^version:/ {print $2; exit}'
-}
-
-bbrv3_installed_packages() {
-  local manifest
-  local package
-  local recorded_version
-  local installed_version
-  local _architecture
-  local _asset
-  local -A seen=()
-
-  [[ "$BBRV3_STATE_ROOT" == /* && "$BBRV3_STATE_ROOT" != "/" ]] || die "BBRV3_STATE_ROOT must be a non-root absolute path"
-
-  for manifest in "$BBRV3_STATE_ROOT"/*/packages.tsv; do
-    [[ -f "$manifest" ]] || continue
-    while IFS=$'\t' read -r package recorded_version _architecture _asset; do
-      [[ "$package" =~ ^linux-(image|headers)-[A-Za-z0-9.+~_-]+$ ]] || continue
-      [[ -z "${seen[$package]:-}" ]] || continue
-      seen[$package]=1
-      installed_version="$(dpkg-query -W -f='${Version}' "$package" 2>/dev/null || true)"
-      [[ -n "$installed_version" ]] || continue
-      printf '%s %s\n' "$package" "$installed_version"
-    done <"$manifest"
-  done
-}
-
-bbrv3_check() {
-  printf '\nBBRv3 status:\n'
-  printf 'os: %s\n' "$(awk -F= '/^PRETTY_NAME=/ {gsub(/"/, "", $2); print $2; found=1} END{if(!found) print "unknown"}' /etc/os-release 2>/dev/null || echo unknown)"
-  printf 'kernel: %s\n' "$(uname -r)"
-  printf 'tcp_bbr_version: %s\n' "$(bbrv3_module_version || echo unknown)"
-  printf 'tcp_available_congestion_control: %s\n' "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo unknown)"
-  printf 'tcp_congestion_control: %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
-  printf 'default_qdisc: %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
-  printf 'bbrv3_lock: %s\n' "$(bbrv3_locked_tag || echo none)"
-  printf 'reboot_required: %s\n' "$([[ -e /var/run/reboot-required ]] && echo yes || echo "${BBRV3_NEEDS_REBOOT:-unknown}")"
-  printf 'legacy_99_vps_tcp_tune: %s\n' "$([[ -e /etc/sysctl.d/99-vps-tcp-tune.conf ]] && echo present || echo absent)"
-  printf 'legacy_99_joeyblog: %s\n' "$([[ -e /etc/sysctl.d/99-joeyblog.conf ]] && echo present || echo absent)"
-  printf 'installed_bbrv3_kernel_packages:\n'
-  bbrv3_installed_packages | sed 's/^/  /' || true
-}
-
-bbrv3_restore_latest_sysctl_backup() {
-  local latest
-  local status
-  local path
-  local source
-  [[ "$BBRV3_BACKUP_ROOT" == /* && "$BBRV3_BACKUP_ROOT" != "/" ]] || die "BBRV3_BACKUP_ROOT must be a non-root absolute path"
-  latest="$(ls -dt "${BBRV3_BACKUP_ROOT}"/*-bbrv3 2>/dev/null | head -n 1 || true)"
-  [[ -n "$latest" ]] || return 0
-
-  [[ -f "$latest/manifest.tsv" ]] || {
-    log "warning: legacy full-directory sysctl backup found at $latest; not restoring it automatically"
-    return 0
-  }
-
-  while IFS=$'\t' read -r status path; do
-    case "$path" in
-      /etc/sysctl.d/90-vps-bbr-fq.conf|/etc/sysctl.d/99-vps-tcp-tune.conf|\
-      /etc/sysctl.d/99-joeyblog.conf|/etc/sysctl.d/98-vps-baseline.conf|/etc/sysctl.d/99-bbr-fq.conf)
-        ;;
-      *)
-        die "sysctl backup contains unsupported path: $path"
-        ;;
-    esac
-    [[ ! -d "$path" || -L "$path" ]] || die "refusing to replace unexpected directory during rollback: $path"
-    source="$latest/files/${path#/}"
-    case "$status" in
-      present)
-        [[ -e "$source" || -L "$source" ]] || die "sysctl backup is incomplete: $source"
-        rm -f "$path"
-        install -d -m 0755 "$(dirname "$path")"
-        cp -a "$source" "$path"
-        ;;
-      absent)
-        rm -f "$path"
-        ;;
-      *)
-        die "sysctl backup has invalid manifest status: $status"
-        ;;
-    esac
-  done <"$latest/manifest.tsv"
-  sysctl --system >/dev/null 2>&1 || true
-  log "restored only vps-firstboot-managed sysctl files from $latest"
-}
-
-bbrv3_rollback() {
-  local running
-  local pkg
-
-  [[ "$(id -u)" -eq 0 ]] || die "run as root for BBRv3 rollback"
-  command -v dpkg-query >/dev/null 2>&1 || die "dpkg-query is required for rollback"
-
-  cat <<PLAN
-
-BBRv3 rollback plan:
-  restore latest sysctl backup if available
-  remove vps-firstboot BBR/fq sysctl file
-  remove only non-running kernel packages recorded in the vps-firstboot install manifest
-  never remove the currently running kernel
-
-PLAN
-  confirm "Proceed with BBRv3 rollback?" || die "aborted"
-
-  rm -f /etc/sysctl.d/90-vps-bbr-fq.conf
-  bbrv3_restore_latest_sysctl_backup
-
-  running="$(uname -r)"
-  while read -r pkg _version; do
-    [[ -n "$pkg" ]] || continue
-    if [[ "$pkg" == *"$running"* ]]; then
-      log "keeping currently running kernel package: $pkg"
-      continue
-    fi
-    log "removing package: $pkg"
-    apt-get remove -y "$pkg" || true
-  done <<EOF
-$(bbrv3_installed_packages)
-EOF
-
-  if command -v update-grub >/dev/null 2>&1; then
-    update-grub >/dev/null 2>&1 || true
-  fi
-  bbrv3_check
-}
-
-run_bbrv3_action() {
-  case "$BBRV3_ACTION" in
-    install)
-      bbrv3_install
-      ;;
-    check)
-      bbrv3_check
-      ;;
-    rollback)
-      bbrv3_rollback
-      ;;
-    network-rollback)
-      network_rollback
-      ;;
-  esac
-}
-
 install_bpftune_build_deps() {
   if command -v apt-get >/dev/null 2>&1; then
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update
-    apt-get install -y git make gcc pkg-config clang llvm bpftool libbpf-dev libcap-dev libnl-3-dev libnl-route-3-dev python3-docutils
+    apt_update
+    apt_get install git make gcc pkg-config clang llvm bpftool libbpf-dev libcap-dev libnl-3-dev libnl-route-3-dev python3-docutils
   elif command -v dnf >/dev/null 2>&1; then
     dnf install -y git make gcc pkgconf-pkg-config clang llvm bpftool libbpf-devel libcap-devel libnl3-devel python3-docutils
   elif command -v yum >/dev/null 2>&1; then
@@ -2479,6 +2254,8 @@ Security profile:
   root login:       key-only
   locale fix:       $(locale_plan_value)
   fail2ban:         $ENABLE_FAIL2BAN
+  system update:    $ENABLE_SYSTEM_UPDATE
+  old ssh ports:    ${SSH_TEMP_PORTS:-none} (stay open until confirm-ssh)
 
 Would validate and write the SSH hardening drop-in:
 SECURITY_DRYRUN
@@ -2505,7 +2282,6 @@ Profile:
   smart tune:       $SMART_TCP_TUNE
   bdp tune:         $(bdp_plan_value)
   ipv4 preference:  $(ipv4_preference_plan_value)
-  bbrv3 kernel:     $ENABLE_BBRV3_KERNEL / $BBRV3_FLAVOR / ${BBRV3_VERSION:-locked-or-latest}
   bpftune:          $ENABLE_BPFTUNE
   tc shaping:       ${TC_IFACE:-disabled}${TC_RATE:+ @ $TC_RATE}
 
@@ -2523,17 +2299,6 @@ DRYRUN
   if [[ "$ENABLE_BBR_FQ" == "yes" ]]; then
     printf '\nWould write fq restore files:\n'
     print_fq_restore_files
-  fi
-
-  if [[ "$ENABLE_BBRV3_KERNEL" == "yes" ]]; then
-    cat <<BBRV3_PREVIEW
-
-Would install standard BBRv3 kernel packages from GitHub Releases:
-  repo: $BBRV3_REPO
-  version: ${BBRV3_VERSION:-locked tag if present, otherwise latest standard release}
-  lock version: $BBRV3_LOCK_VERSION
-  automatic reboot: no
-BBRV3_PREVIEW
   fi
 
   if [[ -n "$TC_IFACE" && -n "$TC_RATE" ]]; then
@@ -2567,6 +2332,8 @@ print_plan() {
   public key:        $([[ -n "$PUBLIC_KEY" ]] && printf 'provided (content hidden)' || printf 'root authorized_keys fallback')
   locale fix:        $(locale_plan_value)
   fail2ban:          $ENABLE_FAIL2BAN
+  system update:     $ENABLE_SYSTEM_UPDATE
+  old ssh ports:     ${SSH_TEMP_PORTS:-none} (stay open until confirm-ssh)
 SECURITY_PLAN
   else
     printf '  Part 1 security:   skipped\n'
@@ -2581,7 +2348,6 @@ SECURITY_PLAN
   smart tune:        $SMART_TCP_TUNE
   bdp tune:          $(bdp_plan_value)
   ipv4 preference:   $(ipv4_preference_plan_value)
-  bbrv3 kernel:      $ENABLE_BBRV3_KERNEL / $BBRV3_FLAVOR / ${BBRV3_VERSION:-locked-or-latest}
   bpftune:           $ENABLE_BPFTUNE
   tcp profile:       $TUNE_REGION / $TUNE_BANDWIDTH$([[ "$TUNE_BANDWIDTH" == "auto" ]] || printf 'Mbps')
   profile source:    $TUNE_REGION_SOURCE / $TUNE_BANDWIDTH_SOURCE
@@ -2598,96 +2364,188 @@ NETWORK_PLAN
   fi
 }
 
+kernel_source() {
+  local maintainer
+
+  maintainer="$(dpkg-query -W -f='${Maintainer}' "linux-image-$(uname -r)" 2>/dev/null || true)"
+  case "$maintainer" in
+    "") printf 'unknown\n' ;;
+    *debian-kernel@lists.debian.org*|*kernel-team@lists.ubuntu.com*) printf 'official\n' ;;
+    *) printf 'third-party\n' ;;
+  esac
+}
+
+third_party_kernels() {
+  { dpkg-query -W -f='${db:Status-Status} ${binary:Package} ${Maintainer}\n' 'linux-image-*' 2>/dev/null || true; } |
+    awk '$1 == "installed" && !/debian-kernel@lists\.debian\.org|kernel-team@lists\.ubuntu\.com/ {print $2}' |
+    xargs
+}
+
+newest_installed_kernel() {
+  local kernel
+
+  for kernel in /boot/vmlinuz-*; do
+    [[ -e "$kernel" ]] || continue
+    printf '%s\n' "${kernel##*/vmlinuz-}"
+  done | sort -V | tail -n 1
+}
+
+reboot_required() {
+  local newest
+
+  [[ ! -e /var/run/reboot-required ]] || return 0
+  newest="$(newest_installed_kernel)"
+  [[ -n "$newest" && "$newest" != "$(uname -r)" ]]
+}
+
+tcp_bbr_version() {
+  if [[ -r /sys/module/tcp_bbr/version ]]; then
+    cat /sys/module/tcp_bbr/version
+  elif [[ -d /sys/module/tcp_bbr ]]; then
+    printf '1\n'
+  else
+    printf 'not-loaded\n'
+  fi
+}
+
+default_route_qdiscs() {
+  local iface="$1"
+  tc qdisc show dev "$iface" 2>/dev/null | awk '{print $2}' | sort -u | xargs
+}
+
+print_ssh_ports_status() {
+  local file
+  local temp_ports="none"
+
+  if file="$(sshd_temp_block_file)"; then
+    temp_ports="$(sshd_temp_ports_in "$file")"
+  fi
+  printf 'ssh_ports: %s\n' "$(sshd_effective_ports | xargs)"
+  printf 'ssh_temporary_ports: %s\n' "$temp_ports"
+}
+
+print_kernel_status() {
+  local third_party
+
+  third_party="$(third_party_kernels)"
+  printf 'kernel: %s\n' "$(uname -r)"
+  printf 'kernel_source: %s\n' "$(kernel_source)"
+  printf 'third_party_kernels: %s\n' "${third_party:-none}"
+  printf 'reboot_required: %s\n' "$(reboot_required && echo yes || echo no)"
+  printf 'tcp_bbr_version: %s\n' "$(tcp_bbr_version)"
+}
+
+status_check() {
+  local iface
+
+  printf '\nStatus:\n'
+  printf 'os: %s\n' "$(os_release_value PRETTY_NAME)"
+  print_kernel_status
+  printf 'tcp_available_congestion_control: %s\n' "$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo unknown)"
+  printf 'tcp_congestion_control: %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+  printf 'default_qdisc: %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+  for iface in $(ip route show default 2>/dev/null | awk '{print $5}' | sort -u); do
+    printf 'qdiscs_on_%s: %s\n' "$iface" "$(default_route_qdiscs "$iface")"
+  done
+  print_ssh_ports_status
+  printf 'automatic_updates: %s\n' "$([[ -f /etc/apt/apt.conf.d/20auto-upgrades ]] && echo yes || echo no)"
+}
+
 show_verification_status() {
   local bbr_available
   local default_ifaces
   local sshd_t
   local iface_index=0
+  local iface
   sshd_t=""
-  if ssh_hardening_enabled; then
-    sshd_t="$(sshd -T 2>/dev/null || true)"
+  if security_part_enabled; then
+    sshd_t="$("$(sshd_binary)" -T 2>/dev/null || true)"
   fi
   bbr_available="unknown"
   default_ifaces=""
   if network_part_enabled; then
-    bbr_available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr && echo yes || echo no)"
+    bbr_available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+    if [[ " $bbr_available " == *" bbr "* ]]; then
+      bbr_available="yes"
+    else
+      bbr_available="no"
+    fi
     default_ifaces="$(ip route show default 2>/dev/null | awk '{print $5}' | sort -u | tr '\n' ' ' || true)"
   fi
 
   printf '\nVerification:\n'
-  if ssh_hardening_enabled; then
-    printf 'ssh_listen_target: %s\n' "$(ss -ltnp | grep -Eq "[:.]${SSH_PORT}\\b" && echo yes || echo no)"
-    printf 'ssh_listen_22: %s\n' "$(ss -ltnp | grep -Eq '[:.]22\\b' && echo yes || echo no)"
-    printf 'sshd_port: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^port / {print $2; exit}')"
+  print_kernel_status
+  if security_part_enabled; then
+    printf 'system_update: %s\n' "$SYSTEM_UPDATE_RESULT"
+    printf 'ssh_listen_target: %s\n' "$(port_is_listening "$SSH_PORT" && echo yes || echo no)"
+    print_ssh_ports_status
     printf 'pubkeyauthentication: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^pubkeyauthentication / {print $2; exit}')"
     printf 'passwordauthentication: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^passwordauthentication / {print $2; exit}')"
     printf 'permitrootlogin: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^permitrootlogin / {print $2; exit}')"
     printf 'allowusers: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^allowusers / {$1=""; sub(/^ /, ""); print; exit}')"
     printf 'usedns: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^usedns / {print $2; exit}')"
     printf 'acceptenv: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^acceptenv / {$1=""; sub(/^ /, ""); print; exit}')"
-  fi
-  if security_part_enabled; then
     printf 'system_locale: %s\n' "$(awk -F= '/^LANG=/ {gsub(/"/, "", $2); print $2; found=1} END{if(!found) print "unknown"}' /etc/default/locale 2>/dev/null || echo unknown)"
     printf 'locale_check_skip: %s\n' "$([[ -e /var/lib/cloud/instance/locale-check.skip ]] && echo yes || echo no)"
   fi
 
   if network_part_enabled; then
-  printf 'tcp_profile: %s/%s%s\n' "$TUNE_REGION" "$TUNE_BANDWIDTH" "$([[ "$TUNE_BANDWIDTH" == "auto" ]] || printf 'Mbps')"
-  printf 'tcp_role: %s\n' "$TUNE_ROLE"
-  printf 'tcp_objective: %s\n' "$TUNE_OBJECTIVE"
-  printf 'tcp_tune_mode: %s\n' "$(tcp_tune_plan_value)"
-  printf 'tcp_profile_source: %s/%s\n' "$TUNE_REGION_SOURCE" "$TUNE_BANDWIDTH_SOURCE"
-  if [[ "$SHOW_SENSITIVE" == "yes" ]]; then
-    printf 'tcp_profile_country: %s\n' "${TUNE_COUNTRY_CODE:-unknown}"
-    printf 'tcp_profile_iface: %s\n' "${TUNE_DEFAULT_IFACE:-unknown}"
-  else
-    printf 'tcp_profile_country: %s\n' "$([[ -n "$TUNE_COUNTRY_CODE" ]] && printf 'detected (hidden)' || printf 'not-detected')"
-    printf 'tcp_profile_iface: %s\n' "$([[ -n "$TUNE_DEFAULT_IFACE" ]] && printf 'detected (hidden)' || printf 'not-detected')"
-  fi
-  printf 'bdp_tune: %s\n' "$(bdp_plan_value)"
-  printf 'ipv4_preference: %s\n' "$(grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]|$)' /etc/gai.conf 2>/dev/null && echo yes || echo no)"
-  printf 'bbr_available: %s\n' "$bbr_available"
-  printf 'default_qdisc: %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
-  printf 'tcp_congestion_control: %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
-  printf 'rmem_max: %s\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || echo unknown)"
-  printf 'wmem_max: %s\n' "$(sysctl -n net.core.wmem_max 2>/dev/null || echo unknown)"
-  printf 'tcp_rmem: %s\n' "$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || echo unknown)"
-  printf 'tcp_wmem: %s\n' "$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || echo unknown)"
-  printf 'tcp_limit_output_bytes: %s\n' "$(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null || echo unknown)"
-  printf 'tcp_slow_start_after_idle: %s\n' "$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo unknown)"
-  printf 'tcp_mtu_probing: %s\n' "$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo unknown)"
-  printf 'somaxconn: %s\n' "$(sysctl -n net.core.somaxconn 2>/dev/null || echo unknown)"
-  printf 'tcp_max_syn_backlog: %s\n' "$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo unknown)"
-  printf 'network_backup: %s\n' "${NETWORK_BACKUP_DIR:-none-this-run}"
-  printf 'legacy_tcp_tune_conf: %s\n' "$([[ -e /etc/sysctl.d/99-vps-tcp-tune.conf ]] && echo present || echo disabled)"
-  printf 'fq_restore_service: %s\n' "$(systemctl is-enabled vps-fq-restore.service 2>/dev/null || echo unavailable)"
-
-  if [[ "$ENABLE_BPFTUNE" == "yes" || -x "$(command -v bpftune || true)" ]]; then
-    printf 'bpftune_binary: %s\n' "$(command -v bpftune 2>/dev/null || echo not-installed)"
-    if command -v systemctl >/dev/null 2>&1; then
-      printf 'bpftune_service: %s/%s\n' "$(systemctl is-enabled bpftune.service 2>/dev/null || echo unavailable)" "$(systemctl is-active bpftune.service 2>/dev/null || echo inactive)"
-    else
-      printf 'bpftune_service: %s\n' "unavailable"
-    fi
-  fi
-
-  for iface in $default_ifaces; do
-    iface_index=$(( iface_index + 1 ))
+    printf 'tcp_profile: %s/%s%s\n' "$TUNE_REGION" "$TUNE_BANDWIDTH" "$([[ "$TUNE_BANDWIDTH" == "auto" ]] || printf 'Mbps')"
+    printf 'tcp_role: %s\n' "$TUNE_ROLE"
+    printf 'tcp_objective: %s\n' "$TUNE_OBJECTIVE"
+    printf 'tcp_tune_mode: %s\n' "$(tcp_tune_plan_value)"
+    printf 'tcp_profile_source: %s/%s\n' "$TUNE_REGION_SOURCE" "$TUNE_BANDWIDTH_SOURCE"
     if [[ "$SHOW_SENSITIVE" == "yes" ]]; then
-      printf 'tc_qdisc_%s: %s\n' "$iface" "$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1 {print; found=1} END{if(!found) print "unknown"}')"
+      printf 'tcp_profile_country: %s\n' "${TUNE_COUNTRY_CODE:-unknown}"
+      printf 'tcp_profile_iface: %s\n' "${TUNE_DEFAULT_IFACE:-unknown}"
     else
-      printf 'tc_qdisc_default_%s: %s\n' "$iface_index" "$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1 {print; found=1} END{if(!found) print "unknown"}')"
+      printf 'tcp_profile_country: %s\n' "$([[ -n "$TUNE_COUNTRY_CODE" ]] && printf 'detected (hidden)' || printf 'not-detected')"
+      printf 'tcp_profile_iface: %s\n' "$([[ -n "$TUNE_DEFAULT_IFACE" ]] && printf 'detected (hidden)' || printf 'not-detected')"
     fi
-  done
+    printf 'bdp_tune: %s\n' "$(bdp_plan_value)"
+    printf 'ipv4_preference: %s\n' "$(grep -Eq '^[[:space:]]*precedence[[:space:]]+::ffff:0:0/96[[:space:]]+100([[:space:]]|$)' /etc/gai.conf 2>/dev/null && echo yes || echo no)"
+    printf 'bbr_available: %s\n' "$bbr_available"
+    printf 'default_qdisc: %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+    printf 'tcp_congestion_control: %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+    printf 'rmem_max: %s\n' "$(sysctl -n net.core.rmem_max 2>/dev/null || echo unknown)"
+    printf 'wmem_max: %s\n' "$(sysctl -n net.core.wmem_max 2>/dev/null || echo unknown)"
+    printf 'tcp_rmem: %s\n' "$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null || echo unknown)"
+    printf 'tcp_wmem: %s\n' "$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null || echo unknown)"
+    printf 'tcp_limit_output_bytes: %s\n' "$(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null || echo unknown)"
+    printf 'tcp_slow_start_after_idle: %s\n' "$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null || echo unknown)"
+    printf 'tcp_mtu_probing: %s\n' "$(sysctl -n net.ipv4.tcp_mtu_probing 2>/dev/null || echo unknown)"
+    printf 'somaxconn: %s\n' "$(sysctl -n net.core.somaxconn 2>/dev/null || echo unknown)"
+    printf 'tcp_max_syn_backlog: %s\n' "$(sysctl -n net.ipv4.tcp_max_syn_backlog 2>/dev/null || echo unknown)"
+    printf 'network_backup: %s\n' "${NETWORK_BACKUP_DIR:-none-this-run}"
+    printf 'legacy_tcp_tune_conf: %s\n' "$([[ -e /etc/sysctl.d/99-vps-tcp-tune.conf ]] && echo present || echo disabled)"
+    printf 'fq_restore_service: %s\n' "$(systemctl is-enabled vps-fq-restore.service 2>/dev/null || echo unavailable)"
 
-  if [[ -n "$TC_IFACE" && -n "$TC_RATE" ]]; then
-    if [[ "$SHOW_SENSITIVE" == "yes" ]]; then
-      printf 'tc_shape: %s @ %s\n' "$TC_IFACE" "$TC_RATE"
-    else
-      printf 'tc_shape: configured @ %s (interface hidden)\n' "$TC_RATE"
+    if [[ "$ENABLE_BPFTUNE" == "yes" || -x "$(command -v bpftune || true)" ]]; then
+      printf 'bpftune_binary: %s\n' "$(command -v bpftune 2>/dev/null || echo not-installed)"
+      if command -v systemctl >/dev/null 2>&1; then
+        printf 'bpftune_service: %s/%s\n' "$(systemctl is-enabled bpftune.service 2>/dev/null || echo unavailable)" "$(systemctl is-active bpftune.service 2>/dev/null || echo inactive)"
+      else
+        printf 'bpftune_service: %s\n' "unavailable"
+      fi
     fi
-    printf 'tc_qdisc_root: %s\n' "$(tc qdisc show dev "$TC_IFACE" 2>/dev/null | awk 'NR==1 {print; found=1} END{if(!found) print "unknown"}')"
-  fi
+
+    for iface in $default_ifaces; do
+      iface_index=$(( iface_index + 1 ))
+      if [[ "$SHOW_SENSITIVE" == "yes" ]]; then
+        printf 'qdiscs_on_%s: %s\n' "$iface" "$(default_route_qdiscs "$iface")"
+      else
+        printf 'qdiscs_on_default_%s: %s\n' "$iface_index" "$(default_route_qdiscs "$iface")"
+      fi
+    done
+
+    if [[ -n "$TC_IFACE" && -n "$TC_RATE" ]]; then
+      if [[ "$SHOW_SENSITIVE" == "yes" ]]; then
+        printf 'tc_shape: %s @ %s\n' "$TC_IFACE" "$TC_RATE"
+      else
+        printf 'tc_shape: configured @ %s (interface hidden)\n' "$TC_RATE"
+      fi
+      printf 'tc_qdisc_root: %s\n' "$(tc qdisc show dev "$TC_IFACE" 2>/dev/null | awk 'NR==1 {print; found=1} END{if(!found) print "unknown"}')"
+    fi
   fi
 
   if [[ "$ENABLE_FAIL2BAN" == "yes" ]]; then
@@ -2707,24 +2565,57 @@ show_verification_status() {
   fi
 }
 
+install_self() {
+  local source
+
+  source="$(readlink -f "$0" 2>/dev/null || true)"
+  if [[ ! -f "$source" ]]; then
+    log "warning: this run came from a pipe, so $SELF_PATH was not installed; save the script to a file to use confirm-ssh"
+    return 0
+  fi
+  [[ "$source" != "$SELF_PATH" ]] || return 0
+  install -d -m 0755 "$(dirname "$SELF_PATH")"
+  install -m 0755 "$source" "$SELF_PATH"
+}
+
 final_message() {
-  if ssh_hardening_enabled; then
-    cat <<DONE
+  local third_party
 
-Done.
+  printf '\nDone. The current verification status is shown above.\n'
 
-The current verification status is shown above.
+  if security_part_enabled; then
+    cat <<SSH_DONE
 
-Do not close this terminal yet. Open a second terminal and test:
+Do not close this terminal yet. Allow TCP $SSH_PORT in your provider's firewall
+or security group, then log in from a second terminal:
   ssh -p $SSH_PORT $SSH_USER@SERVER_IP
-DONE
-  else
-    cat <<DONE
+SSH_DONE
+    if [[ -n "$SSH_TEMP_PORTS" ]]; then
+      cat <<SSH_CONFIRM
 
-Done.
+SSH still listens on the old port(s) too: $SSH_TEMP_PORTS
+After the login above works, run this from that new session to close them:
+  vps-firstboot confirm-ssh
+SSH_CONFIRM
+    fi
+  fi
 
-The current TCP/network verification status is shown above.
-DONE
+  if [[ "$SYSTEM_UPDATE_RESULT" == "failed" ]]; then
+    printf '\nSystem update failed, so security updates are still missing. Fix apt and rerun.\n'
+  fi
+
+  third_party="$(third_party_kernels)"
+  if [[ -n "$third_party" ]]; then
+    cat <<THIRD_PARTY
+
+Third-party kernels are installed: $third_party
+GRUB boots the highest version, so Debian's kernel security updates may never
+take effect. Remove them with apt-get purge, then run update-grub.
+THIRD_PARTY
+  fi
+
+  if reboot_required; then
+    printf '\nA newer kernel or library was installed. Reboot when ready:\n  reboot\n'
   fi
 
   if [[ -n "$NETWORK_BACKUP_DIR" ]]; then
@@ -2734,20 +2625,8 @@ Network rollback point:
   $NETWORK_BACKUP_DIR
 
 To restore it without changing the kernel or SSH configuration:
-  bash /root/vps-firstboot.sh network-rollback -y
+  vps-firstboot network-rollback -y
 ROLLBACK_DONE
-  fi
-
-  if [[ "$BBRV3_NEEDS_REBOOT" == "yes" ]]; then
-    cat <<BBRV3_DONE
-
-BBRv3 kernel packages are installed, but this script did not reboot automatically.
-Reboot during your maintenance window:
-  reboot
-
-After reboot, verify:
-  bash /root/vps-firstboot.sh check
-BBRV3_DONE
   fi
 
   if network_part_enabled && [[ "$ENABLE_BDP_TUNE" == "yes" ]]; then
@@ -2769,12 +2648,25 @@ BDP_DONE
 main() {
   parse_args "$@"
 
-  if [[ "$BBRV3_ACTION" != "setup" ]]; then
-    run_bbrv3_action
-    exit 0
-  fi
+  case "$ACTION" in
+    check)
+      status_check
+      exit 0
+      ;;
+    confirm-ssh)
+      confirm_ssh
+      exit 0
+      ;;
+    network-rollback)
+      network_rollback
+      exit 0
+      ;;
+  esac
 
   validate_inputs
+  if security_part_enabled; then
+    detect_ssh_temp_ports
+  fi
 
   if [[ "$DRY_RUN" == "yes" ]]; then
     print_tcp_tune_dry_run
@@ -2788,26 +2680,26 @@ main() {
     network) confirm "Proceed with Part 2 BBR/TCP/network tuning?" || die "aborted" ;;
   esac
 
+  install_self
+
   if security_part_enabled; then
+    wait_for_boot_tasks
+    check_ssh_port_available
     install_authorized_keys
     configure_sshd
+    system_update
     configure_locale
-    install_fail2ban
+    if ! install_fail2ban; then
+      log "warning: fail2ban setup failed; continuing with the remaining setup"
+    fi
   fi
 
   if network_part_enabled; then
     network_backup_config
-    if [[ "$ENABLE_BBRV3_KERNEL" == "yes" ]]; then
-      bbrv3_backup_sysctl
-    fi
-
     configure_ipv4_preference
     configure_tcp_tune
     configure_tc_shaping
     install_bpftune
-    if [[ "$ENABLE_BBRV3_KERNEL" == "yes" ]]; then
-      bbrv3_install
-    fi
   fi
   show_verification_status
   final_message

@@ -36,23 +36,39 @@ bash -n "$SCRIPT"
 bash -n "$REPO_DIR/vps-security.sh"
 bash -n "$REPO_DIR/vps-network-tune.sh"
 bash -n "$REPO_DIR/vps-speedtest.sh"
-bash -n "$REPO_DIR/vps-fleet-bbrv3.sh"
 
-assert_contains "$SCRIPT" 'release asset $name has no usable GitHub SHA-256 digest'
-assert_contains "$SCRIPT" 'BBRV3_STATE_ROOT"/*/packages.tsv'
-assert_not_contains "$SCRIPT" "awk '/bbr|joey|7\\./"
 assert_not_contains "$SCRIPT" '    /etc/sysctl.d \'
+assert_not_contains "$SCRIPT" 'byJoey'
+assert_not_contains "$SCRIPT" 'dpkg -i'
 
 preview general --role general --region asia --bandwidth 1000
 assert_contains "$TEST_TMP/general" "tcp sysctl:       minimal / system buffers"
 assert_contains "$TEST_TMP/general" "net.ipv4.tcp_congestion_control = bbr"
 assert_contains "$TEST_TMP/general" "net.core.default_qdisc = fq"
-assert_contains "$TEST_TMP/general" "bbrv3 kernel:     no /"
-assert_not_contains "$TEST_TMP/general" "Would install standard BBRv3 kernel packages"
+assert_not_contains "$TEST_TMP/general" "BBRv3"
+assert_not_contains "$TEST_TMP/general" "bbrv3"
+assert_not_contains "$TEST_TMP/general" "net.ipv4.tcp_slow_start_after_idle"
 
-preview bbrv3-opt-in --role general --region asia --bandwidth 1000 --enable-bbrv3-kernel
-assert_contains "$TEST_TMP/bbrv3-opt-in" "bbrv3 kernel:     yes /"
-assert_contains "$TEST_TMP/bbrv3-opt-in" "Would install standard BBRv3 kernel packages"
+# Saved commands may still pass this flag: it must keep working and change nothing.
+bash "$SCRIPT" --network-only --role general --region asia --bandwidth 1000 --no-bbrv3-kernel --dry-run >"$TEST_TMP/old-flag" 2>&1
+assert_contains "$TEST_TMP/old-flag" "--no-bbrv3-kernel no longer has any effect"
+assert_contains "$TEST_TMP/old-flag" "net.ipv4.tcp_congestion_control = bbr"
+
+for removed in --enable-bbrv3-kernel --bbrv3-max --lock-bbrv3-version; do
+  if bash "$SCRIPT" --network-only --role general "$removed" --dry-run >"$TEST_TMP/removed" 2>&1; then
+    printf '%s unexpectedly succeeded\n' "$removed" >&2
+    exit 1
+  fi
+  assert_contains "$TEST_TMP/removed" "uses BBR from the distribution kernel"
+done
+
+for removed in install rollback; do
+  if bash "$SCRIPT" "$removed" -y >"$TEST_TMP/removed" 2>&1; then
+    printf '%s unexpectedly succeeded\n' "$removed" >&2
+    exit 1
+  fi
+  assert_contains "$TEST_TMP/removed" "uses BBR from the distribution kernel"
+done
 
 preview transit --role transit --region asia --bandwidth 625
 assert_contains "$TEST_TMP/transit" "tcp sysctl:       smart / 12MiB"
@@ -76,6 +92,10 @@ assert_contains "$TEST_TMP/web" "tcp sysctl:       web-conservative / system buf
 assert_contains "$TEST_TMP/web" "net.core.somaxconn = 8192"
 assert_contains "$TEST_TMP/web" "net.ipv4.tcp_max_syn_backlog = 8192"
 assert_not_contains "$TEST_TMP/web" "net.ipv4.tcp_slow_start_after_idle"
+
+preview web-single --role web --objective single-stream --target-mbps 800 --rtt-ms 75 --bdp-factor 2
+assert_contains "$TEST_TMP/web-single" "tcp sysctl:       bdp-2x / 15000000 bytes"
+assert_contains "$TEST_TMP/web-single" "net.ipv4.tcp_slow_start_after_idle = 0"
 
 preview bdp --role exit --region asia --bandwidth 1000 --bdp-bandwidth 1000 --bdp-rtt 80
 assert_contains "$TEST_TMP/bdp" "tcp sysctl:       bdp-2x / 20000000 bytes"
@@ -108,6 +128,12 @@ assert_contains "$TEST_TMP/security" "Part 1 / VPS security"
 assert_contains "$TEST_TMP/security" "provided (content hidden)"
 assert_not_contains "$TEST_TMP/security" "unique-private-comment"
 assert_not_contains "$TEST_TMP/security" "/etc/sysctl.d/90-vps-bbr-fq.conf"
+assert_contains "$TEST_TMP/security" "system update:    yes"
+assert_contains "$TEST_TMP/security" "old ssh ports:    22 (stay open until confirm-ssh)"
+assert_contains "$TEST_TMP/security" "# BEGIN temporary SSH ports"
+
+printf '%s\n' "$TEST_PUBLIC_KEY" | bash "$SCRIPT" security --port 22222 --public-key-stdin --no-system-update --dry-run >"$TEST_TMP/security-no-update"
+assert_contains "$TEST_TMP/security-no-update" "system update:    no"
 
 if bash "$SCRIPT" security --dry-run >"$TEST_TMP/security-no-port" 2>&1; then
   printf 'explicit security mode unexpectedly succeeded without an SSH port\n' >&2
