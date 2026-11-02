@@ -1003,6 +1003,34 @@ validate_inputs() {
   fi
 }
 
+# Cloud images add a forced command to root's key that only prints "Please login
+# as the user ...". sshd uses the first matching line, so a clean copy of the same
+# key further down would not help.
+strip_cloud_init_key_restriction() {
+  local auth_keys="$1"
+  local restriction='^[^"]*command="echo '\''Please login as the user ([^"\\]|\\.)*"[[:space:]]+'
+  local tmp_file
+
+  grep -Fq 'Please login as the user' "$auth_keys" || return 0
+
+  cp -p "$auth_keys" "$auth_keys.vps-firstboot.bak"
+  tmp_file="$(mktemp)"
+  sed -E "s/$restriction//" "$auth_keys" | awk '!seen[$0]++' >"$tmp_file"
+  cat "$tmp_file" >"$auth_keys"
+  rm -f "$tmp_file"
+
+  if grep -Fq 'Please login as the user' "$auth_keys"; then
+    die "cannot remove the login restriction from $auth_keys; SSH settings were not changed"
+  fi
+  log "removed the cloud-init login restriction from authorized_keys"
+}
+
+# Without this, cloud-init restricts root's key again on a new instance.
+allow_root_in_cloud_init() {
+  [[ "$SSH_USER" == "root" && -d /etc/cloud/cloud.cfg.d ]] || return 0
+  printf 'disable_root: false\n' >/etc/cloud/cloud.cfg.d/99-vps-firstboot-root-login.cfg
+}
+
 install_authorized_keys() {
   local auth_keys
   local source_keys="/root/.ssh/authorized_keys"
@@ -1037,6 +1065,9 @@ install_authorized_keys() {
   else
     die "no SSH public key supplied, and /root/.ssh/authorized_keys is empty; refusing to disable password login"
   fi
+
+  strip_cloud_init_key_restriction "$auth_keys"
+  allow_root_in_cloud_init
 
   chown "$SSH_USER:$user_group" "$auth_keys"
   chmod 0600 "$auth_keys"
@@ -1446,6 +1477,17 @@ fi
 
 sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
 
+# True for a default mq with simple children left. Custom layouts are kept.
+mq_children_need_fq() {
+  awk '
+    NR == 1 { custom = ($3 != "0:"); next }
+    $2 == "ingress" || $2 == "clsact" || $2 == "fq" { next }
+    $2 ~ /^(pfifo|pfifo_fast|bfifo|fq_codel)$/ { simple = 1; next }
+    { custom = 1 }
+    END { exit !(simple && !custom) }
+  ' <<<"$1"
+}
+
 if [[ -z "${VPS_FQ_IFACES:-}" ]]; then
   VPS_FQ_IFACES="$(ip route show default 2>/dev/null | awk '{print $5}' | sort -u | tr '\n' ' ')"
 fi
@@ -1453,12 +1495,21 @@ fi
 for iface in $VPS_FQ_IFACES; do
   [[ "$iface" == "lo" ]] && continue
   ip link show dev "$iface" >/dev/null 2>&1 || continue
-  root_qdisc="$(tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1 {print $2}')"
+  qdiscs="$(tc qdisc show dev "$iface" 2>/dev/null || true)"
+  root_qdisc="$(awk 'NR==1 {print $2}' <<<"$qdiscs")"
   case "$root_qdisc" in
-    pfifo|pfifo_fast|bfifo|fq_codel) ;;
+    pfifo|pfifo_fast|bfifo|fq_codel)
+      tc qdisc replace dev "$iface" root fq >/dev/null 2>&1 || true
+      ;;
+    mq)
+      # The default mq has handle 0, so its children cannot be replaced one by
+      # one. Deleting it makes the kernel rebuild mq from default_qdisc.
+      if mq_children_need_fq "$qdiscs"; then
+        tc qdisc del dev "$iface" root >/dev/null 2>&1 || true
+      fi
+      ;;
     *) continue ;;
   esac
-  tc qdisc replace dev "$iface" root fq >/dev/null 2>&1 || true
 done
 FQ_SCRIPT
 }
@@ -2432,6 +2483,7 @@ show_verification_status() {
     printf 'passwordauthentication: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^passwordauthentication / {print $2; exit}')"
     printf 'permitrootlogin: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^permitrootlogin / {print $2; exit}')"
     printf 'allowusers: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^allowusers / {$1=""; sub(/^ /, ""); print; exit}')"
+    printf 'ssh_key_restricted: %s\n' "$(grep -Fqs 'Please login as the user' "$(getent passwd "$SSH_USER" | cut -d: -f6)/.ssh/authorized_keys" && echo yes || echo no)"
     printf 'usedns: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^usedns / {print $2; exit}')"
     printf 'acceptenv: %s\n' "$(printf '%s\n' "$sshd_t" | awk '/^acceptenv / {$1=""; sub(/^ /, ""); print; exit}')"
     printf 'system_locale: %s\n' "$(awk -F= '/^LANG=/ {gsub(/"/, "", $2); print $2; found=1} END{if(!found) print "unknown"}' /etc/default/locale 2>/dev/null || echo unknown)"

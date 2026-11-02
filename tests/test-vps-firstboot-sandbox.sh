@@ -635,6 +635,134 @@ assert_absent "$BOX/etc/sysctl.d/90-vps-bbr-fq.conf"
 assert_absent "$BOX/etc/modules-load.d/bbr.conf"
 assert_lacks "$BOX/state/calls" "ssh.service"
 
+# ------------------------------------------------- cloud-init root restriction
+RESTRICTION='no-port-forwarding,no-agent-forwarding,no-X11-forwarding,command="echo '\''Please login as the user \"debian\" rather than the user \"root\".'\'';echo;sleep 10;exit 142" '
+OLD_RESTRICTION='no-port-forwarding,no-agent-forwarding,no-X11-forwarding,command="echo '\''Please login as the user \"debian\" rather than the user \"root\".'\'';echo;sleep 10" '
+ROOT_LOGIN_CFG="etc/cloud/cloud.cfg.d/99-vps-firstboot-root-login.cfg"
+KEYS_FILE="root/.ssh/authorized_keys"
+
+# The same key restricted and supplied again must end up as one clean line.
+new_box key-restricted-same-key
+printf '%s\n' "$RESTRICTION$NEW_KEY" >"$BOX/$KEYS_FILE"
+expect_ok "${SECURITY[@]}" --no-system-update
+[[ "$(cat "$BOX/$KEYS_FILE")" == "$NEW_KEY" ]] || fail "restricted key was not cleaned to one line"
+ok
+assert_has "$BOX/$KEYS_FILE.vps-firstboot.bak" "Please login as the user"
+assert_has "$OUT" "ssh_key_restricted: no"
+
+new_box key-restricted-other-key
+printf '%s\n' "$RESTRICTION$OLD_KEY" >"$BOX/$KEYS_FILE"
+expect_ok "${SECURITY[@]}" --no-system-update
+[[ "$(sed -n '1p' "$BOX/$KEYS_FILE")" == "$OLD_KEY" ]] || fail "provider key was not cleaned"
+[[ "$(sed -n '2p' "$BOX/$KEYS_FILE")" == "$NEW_KEY" ]] || fail "new key is missing"
+ok
+
+new_box key-restricted-fallback
+printf '%s\n' "$RESTRICTION$NEW_KEY" >"$BOX/$KEYS_FILE"
+expect_ok security --port 20022 --no-system-update --yes
+[[ "$(cat "$BOX/$KEYS_FILE")" == "$NEW_KEY" ]] || fail "fallback left the restriction"
+ok
+
+new_box key-restricted-old-format
+printf '%s\n' "$OLD_RESTRICTION$NEW_KEY" >"$BOX/$KEYS_FILE"
+expect_ok security --port 20022 --no-system-update --yes
+[[ "$(cat "$BOX/$KEYS_FILE")" == "$NEW_KEY" ]] || fail "old format left the restriction"
+ok
+
+# A forced command the user set on another key is not ours to remove.
+new_box key-other-command-kept
+printf '%s\n%s\n' "command=\"/usr/local/bin/backup\" $OLD_KEY" "$RESTRICTION$NEW_KEY" >"$BOX/$KEYS_FILE"
+expect_ok security --port 20022 --no-system-update --yes
+[[ "$(sed -n '1p' "$BOX/$KEYS_FILE")" == "command=\"/usr/local/bin/backup\" $OLD_KEY" ]] || fail "user's forced command was changed"
+[[ "$(sed -n '2p' "$BOX/$KEYS_FILE")" == "$NEW_KEY" ]] || fail "restricted key was not cleaned"
+ok
+
+# An unknown wording must stop before SSH changes, or the machine locks itself out.
+new_box key-restriction-unknown
+cp "$BOX/etc/ssh/sshd_config" "$BOX/state/config.before"
+printf '%s\n' "command=\"printf Please login as the user debian\" $NEW_KEY" >"$BOX/$KEYS_FILE"
+expect_die security --port 20022 --no-system-update --yes
+assert_has "$OUT" "cannot remove the login restriction"
+assert_absent "$BOX/$INCLUDE_REL"
+cmp -s "$BOX/etc/ssh/sshd_config" "$BOX/state/config.before" || fail "sshd_config changed"
+ok
+
+new_box key-clean-untouched
+printf '%s\n' "$NEW_KEY" >"$BOX/$KEYS_FILE"
+expect_ok security --port 20022 --no-system-update --yes
+assert_absent "$BOX/$KEYS_FILE.vps-firstboot.bak"
+assert_absent "$BOX/$ROOT_LOGIN_CFG"
+
+new_box cloud-init-root-allowed
+mkdir -p "$BOX/etc/cloud/cloud.cfg.d"
+printf '%s\n' "$NEW_KEY" >"$BOX/$KEYS_FILE"
+expect_ok security --port 20022 --no-system-update --yes
+assert_has "$BOX/$ROOT_LOGIN_CFG" "disable_root: false"
+
+new_box cloud-init-other-user
+mkdir -p "$BOX/etc/cloud/cloud.cfg.d"
+expect_ok "${SECURITY[@]}" --no-system-update --user deploy
+assert_absent "$BOX/$ROOT_LOGIN_CFG"
+
+# ------------------------------------------------------------ queue layouts
+# tc reads the live layout from a file; deleting the root rebuilds mq with fq.
+new_qdisc_box() {
+  new_box "$1"
+  printf '%b' "$2" >"$BOX/state/qdiscs"
+  write_stub tc <<EOF
+#!/bin/bash
+case "\$1 \$2" in
+  "qdisc show") cat "$BOX/state/qdiscs" ;;
+  "qdisc del")
+    echo "tc \$*" >>"$BOX/state/calls"
+    printf 'qdisc mq 0: root\nqdisc fq 0: parent :2 limit 10000p\nqdisc fq 0: parent :1 limit 10000p\n' >"$BOX/state/qdiscs"
+    ;;
+  "qdisc replace")
+    echo "tc \$*" >>"$BOX/state/calls"
+    printf 'qdisc fq 8001: root refcnt 2\n' >"$BOX/state/qdiscs"
+    ;;
+esac
+exit 0
+EOF
+}
+
+MQ_FQ_CODEL='qdisc mq 0: root\nqdisc fq_codel 0: parent :2 limit 10240p\nqdisc fq_codel 0: parent :1 limit 10240p\n'
+
+new_qdisc_box qdisc-mq-fq-codel "$MQ_FQ_CODEL"
+expect_ok network --role general --yes
+assert_has "$BOX/state/calls" "tc qdisc del dev eth0 root"
+assert_lacks "$BOX/state/calls" "tc qdisc replace"
+assert_has "$OUT" "qdiscs_on_default_1: fq mq"
+
+new_qdisc_box qdisc-mq-ingress-kept "${MQ_FQ_CODEL}qdisc ingress ffff: parent ffff:fff1 ----------------\n"
+expect_ok network --role general --yes
+assert_has "$BOX/state/calls" "tc qdisc del dev eth0 root"
+
+new_qdisc_box qdisc-mq-already-fq 'qdisc mq 0: root\nqdisc fq 8001: parent :2 limit 10000p\nqdisc fq 8002: parent :1 limit 10000p\n'
+expect_ok network --role general --yes
+assert_lacks "$BOX/state/calls" "tc qdisc del"
+assert_has "$OUT" "qdiscs_on_default_1: fq mq"
+
+new_qdisc_box qdisc-mq-custom-child 'qdisc mq 0: root\nqdisc htb 2: parent :2 r2q 10\nqdisc fq_codel 0: parent :1 limit 10240p\n'
+expect_ok network --role general --yes
+assert_lacks "$BOX/state/calls" "tc qdisc del"
+assert_has "$OUT" "qdiscs_on_default_1: fq_codel htb mq"
+
+new_qdisc_box qdisc-mq-custom-handle 'qdisc mq 1: root\nqdisc fq_codel 0: parent 1:1 limit 10240p\n'
+expect_ok network --role general --yes
+assert_lacks "$BOX/state/calls" "tc qdisc del"
+
+new_qdisc_box qdisc-single-queue 'qdisc fq_codel 0: root refcnt 2 limit 10240p\n'
+expect_ok network --role general --yes
+assert_has "$BOX/state/calls" "tc qdisc replace dev eth0 root fq"
+assert_lacks "$BOX/state/calls" "tc qdisc del"
+assert_has "$OUT" "qdiscs_on_default_1: fq"
+
+new_qdisc_box qdisc-htb-root 'qdisc htb 1: root refcnt 2 r2q 10\nqdisc fq_codel 0: parent 1:10 limit 10240p\n'
+expect_ok network --role general --yes
+assert_lacks "$BOX/state/calls" "tc qdisc del"
+assert_lacks "$BOX/state/calls" "tc qdisc replace"
+
 # ---------------------------------------------------------- exit role reserved
 new_box exit-role-reserves-ssh-port
 printf 'net.ipv4.ip_local_reserved_ports=6000\n' >>"$BOX/state/sysctl"

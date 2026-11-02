@@ -79,6 +79,7 @@ curl -fsSL --retry 3 "$url" -o /root/vps-firstboot.sh &&
 - 目标端口被其他服务占用时直接退出，不改任何文件。
 - 公钥写入前先校验，公钥无效时直接退出。
 - `authorized_keys` 最后一行没有换行时，新公钥不会和它粘在一起。
+- 云镜像给公钥加的 `Please login as the user ...` 限制会被去掉，原文件存为 `authorized_keys.vps-firstboot.bak`。这同时让原来只能登录默认用户的公钥可以登录 root。目标用户是 root 时还会写入 cloud-init 的 `disable_root: false`，防止限制被加回来。去不掉时直接退出，不改 SSH 配置。
 - `sshd -t` 校验失败、重启失败或新端口没有监听时，自动恢复原配置。
 - ufw 或 firewalld 启用时自动放行新端口。其他防火墙默认拒绝入站时只给出警告。
 - 脚本不会自动重启。输出提示安装了新内核时，手动执行 `reboot`。
@@ -270,7 +271,7 @@ bash tests/test-vps-firstboot-sandbox.sh
 /etc/systemd/system/vps-tc-shape.service
 ```
 
-脚本发现 `/etc/sysctl.conf` 或 `/etc/sysctl.d/99-sysctl.conf` 仍有冲突网络参数时只报警，不会删除用户配置。FQ 恢复服务只替换简单的 `pfifo/pfifo_fast/bfifo/fq_codel` 根队列，会保留 `mq`、`multiq`、`htb`、`cake`、`noqueue` 和未知/自定义 qdisc 布局。
+脚本发现 `/etc/sysctl.conf` 或 `/etc/sysctl.d/99-sysctl.conf` 仍有冲突网络参数时只报警，不会删除用户配置。FQ 恢复服务把简单的 `pfifo/pfifo_fast/bfifo/fq_codel` 根队列换成 `fq`。多队列网卡保留默认的 `mq`：子队列还是这些简单队列时，删除根队列让内核重建 `mq`，子队列随 `default_qdisc` 变成 `fq`，重建瞬间会丢弃排队中的包。自定义句柄或自定义子队列的 `mq`，以及 `multiq`、`htb`、`cake`、`noqueue` 和未知 qdisc 布局都不动。
 
 ## 最低验收
 

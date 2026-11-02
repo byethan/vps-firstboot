@@ -153,6 +153,7 @@ assert_contains "$TEST_TMP/security-no-port" "--port is required"
 preview fq-layout --role general
 assert_contains "$TEST_TMP/fq-layout" "pfifo|pfifo_fast|bfifo|fq_codel"
 assert_contains "$TEST_TMP/fq-layout" "*) continue ;;"
+assert_contains "$TEST_TMP/fq-layout" "if mq_children_need_fq"
 
 if bash "$SCRIPT" --network-only --role invalid --region asia --bandwidth 1000 --dry-run >"$TEST_TMP/invalid" 2>&1; then
   printf 'invalid role unexpectedly succeeded\n' >&2
