@@ -46,6 +46,13 @@ assert_not_contains "$SCRIPT" '    /etc/sysctl.d \'
 preview general --role general --region asia --bandwidth 1000
 assert_contains "$TEST_TMP/general" "tcp sysctl:       minimal / system buffers"
 assert_contains "$TEST_TMP/general" "net.ipv4.tcp_congestion_control = bbr"
+assert_contains "$TEST_TMP/general" "net.core.default_qdisc = fq"
+assert_contains "$TEST_TMP/general" "bbrv3 kernel:     no /"
+assert_not_contains "$TEST_TMP/general" "Would install standard BBRv3 kernel packages"
+
+preview bbrv3-opt-in --role general --region asia --bandwidth 1000 --enable-bbrv3-kernel
+assert_contains "$TEST_TMP/bbrv3-opt-in" "bbrv3 kernel:     yes /"
+assert_contains "$TEST_TMP/bbrv3-opt-in" "Would install standard BBRv3 kernel packages"
 
 preview transit --role transit --region asia --bandwidth 625
 assert_contains "$TEST_TMP/transit" "tcp sysctl:       smart / 12MiB"

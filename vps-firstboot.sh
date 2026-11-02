@@ -27,7 +27,7 @@ ALLOW_UNSAFE_BUFFER="${ALLOW_UNSAFE_BUFFER:-no}"
 ENABLE_LOCALE_FIX="${ENABLE_LOCALE_FIX:-yes}"
 SYSTEM_LOCALE="${SYSTEM_LOCALE:-en_US.UTF-8}"
 ENABLE_PREFER_IPV4="${ENABLE_PREFER_IPV4:-yes}"
-ENABLE_BBRV3_KERNEL="${ENABLE_BBRV3_KERNEL:-yes}"
+ENABLE_BBRV3_KERNEL="${ENABLE_BBRV3_KERNEL:-no}"
 ENABLE_BPFTUNE="${ENABLE_BPFTUNE:-no}"
 BPFTUNE_REPO="${BPFTUNE_REPO:-https://github.com/byethan/bpftune.git}"
 BPFTUNE_REF="${BPFTUNE_REF:-main}"
@@ -112,7 +112,7 @@ Options:
   --system-locale NAME  Locale to generate and set. Default: en_US.UTF-8
   --prefer-ipv4         Prefer IPv4 when hostnames have both A and AAAA records. Default: yes
   --no-prefer-ipv4      Do not configure /etc/gai.conf IPv4 preference
-  --enable-bbrv3-kernel Install standard BBRv3 kernel during normal setup. Default: yes
+  --enable-bbrv3-kernel Install standard BBRv3 kernel during normal setup. Default: no
   --no-bbrv3-kernel     Skip BBRv3 kernel install during normal setup
   --enable-bpftune      Build, install, and enable bpftune BPF auto-tuning daemon
   --no-bpftune          Do not install or enable bpftune. Default: no
@@ -173,7 +173,7 @@ What this script does:
   7. optionally write memory-capped smart buffers or explicit BDP-based buffers
   8. configure a UTF-8 system locale and avoid invalid SSH LC_* imports
   9. prefer IPv4 for dual-stack hostname resolution without disabling IPv6
-  10. install standard BBRv3 kernel by default, without automatic reboot
+  10. optionally install standard BBRv3 kernel, without automatic reboot
   11. optionally build and enable bpftune for BPF-driven Linux auto-tuning
   12. optionally install fail2ban and protect the SSH port
   13. optionally configure tc egress shaping when iface and rate are supplied

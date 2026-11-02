@@ -3,7 +3,7 @@
 这套脚本分成两个可以独立执行的部分，同时保留原来的一键总入口：
 
 - 第一部分 `security`：SSH 密钥、端口和登录加固、locale、可选 fail2ban。
-- 第二部分 `network`：BBR + FQ、BBRv3 内核、按用途和目标调 TCP、单线程吞吐、可选 tc/bpftune。
+- 第二部分 `network`：系统内核自带的 BBR + FQ、按用途和目标调 TCP、单线程吞吐、可选 BBRv3 内核和 tc/bpftune。
 - 兼容入口 `all`：先安全初始化，再做网络调优。
 
 安全部分不会修改 sysctl、qdisc 或内核；网络部分不会修改 SSH、密钥、端口或 locale。
@@ -111,7 +111,7 @@ TCP max buffer = BDP bytes × factor + extra_mib × 1,048,576
 
 ### 常用命令
 
-通用机，只启用 BBR + FQ，并安装标准 BBRv3 内核：
+通用机，只启用系统内核自带的 BBR + FQ，不安装第三方内核：
 
 ```bash
 bash /root/vps-network-tune.sh \
@@ -218,6 +218,10 @@ bash /root/vps-firstboot.sh all \
 旧的无子命令写法仍兼容。只传网络参数且不传 SSH 端口时，会自动进入 network 域；新部署建议显式使用 `security`、`network` 或两个独立脚本，避免意图不清。
 
 ## BBRv3 内核管理
+
+默认不安装。`network` 和 `all` 直接启用 Debian 官方内核自带的 BBR（v1）+ FQ。只有加 `--enable-bbrv3-kernel` 或运行 `install` 才会安装 BBRv3 内核。
+
+这个内核来自第三方 GitHub Releases，版本号通常高于 Debian 内核，GRUB 会优先启动它，所以 Debian 的内核安全更新装上后也不会生效，要自己跟进它的更新。
 
 支持 Debian 12/13、Ubuntu 24.04+ 的 `x86_64` 和 `aarch64`：
 
