@@ -271,7 +271,7 @@ bash tests/test-vps-firstboot-sandbox.sh
 /etc/systemd/system/vps-tc-shape.service
 ```
 
-脚本发现 `/etc/sysctl.conf` 或 `/etc/sysctl.d/99-sysctl.conf` 仍有冲突网络参数时只报警，不会删除用户配置。FQ 恢复服务把简单的 `pfifo/pfifo_fast/bfifo/fq_codel` 根队列换成 `fq`。多队列网卡保留默认的 `mq`：子队列还是这些简单队列时，删除根队列让内核重建 `mq`，子队列随 `default_qdisc` 变成 `fq`，重建瞬间会丢弃排队中的包。自定义句柄或自定义子队列的 `mq`，以及 `multiq`、`htb`、`cake`、`noqueue` 和未知 qdisc 布局都不动。
+脚本发现 `/etc/sysctl.conf` 或 `/etc/sysctl.d/99-sysctl.conf` 仍有冲突网络参数时只报警，不会删除用户配置。FQ 恢复服务把简单的 `pfifo/pfifo_fast/bfifo/fq_codel` 根队列换成 `fq`。多队列网卡保留默认的 `mq`：子队列还是这些简单队列时，新建一个句柄为 `1:` 的 `mq` 替换它，子队列随 `default_qdisc` 变成 `fq`，替换瞬间会丢弃排队中的包。自定义句柄或自定义子队列的 `mq`，以及 `multiq`、`htb`、`cake`、`noqueue` 和未知 qdisc 布局都不动。
 
 ## 最低验收
 

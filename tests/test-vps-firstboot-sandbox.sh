@@ -705,20 +705,25 @@ expect_ok "${SECURITY[@]}" --no-system-update --user deploy
 assert_absent "$BOX/$ROOT_LOGIN_CFG"
 
 # ------------------------------------------------------------ queue layouts
-# tc reads the live layout from a file; deleting the root rebuilds mq with fq.
+# tc reads the live layout from a file and follows the real kernel: a handle 0
+# qdisc cannot be deleted or used as a parent, and a new mq gets fq children.
 new_qdisc_box() {
   new_box "$1"
   printf '%b' "$2" >"$BOX/state/qdiscs"
   write_stub tc <<EOF
 #!/bin/bash
-case "\$1 \$2" in
-  "qdisc show") cat "$BOX/state/qdiscs" ;;
-  "qdisc del")
-    echo "tc \$*" >>"$BOX/state/calls"
-    printf 'qdisc mq 0: root\nqdisc fq 0: parent :2 limit 10000p\nqdisc fq 0: parent :1 limit 10000p\n' >"$BOX/state/qdiscs"
+[[ "\$1 \$2" == "qdisc show" ]] && { cat "$BOX/state/qdiscs"; exit 0; }
+echo "tc \$*" >>"$BOX/state/calls"
+case "\$*" in
+  "qdisc del "*)
+    echo "Error: Cannot delete qdisc with handle of zero." >&2
+    exit 2
     ;;
-  "qdisc replace")
-    echo "tc \$*" >>"$BOX/state/calls"
+  *"root handle 1: mq")
+    [[ -e "$BOX/state/tc-mq-fails" ]] && exit 2
+    printf 'qdisc mq 1: root\nqdisc fq 0: parent 1:2 limit 10000p\nqdisc fq 0: parent 1:1 limit 10000p\n' >"$BOX/state/qdiscs"
+    ;;
+  *"root fq")
     printf 'qdisc fq 8001: root refcnt 2\n' >"$BOX/state/qdiscs"
     ;;
 esac
@@ -728,29 +733,45 @@ EOF
 
 MQ_FQ_CODEL='qdisc mq 0: root\nqdisc fq_codel 0: parent :2 limit 10240p\nqdisc fq_codel 0: parent :1 limit 10240p\n'
 
+MQ_REBUILD="tc qdisc replace dev eth0 root handle 1: mq"
+
 new_qdisc_box qdisc-mq-fq-codel "$MQ_FQ_CODEL"
 expect_ok network --role general --yes
-assert_has "$BOX/state/calls" "tc qdisc del dev eth0 root"
-assert_lacks "$BOX/state/calls" "tc qdisc replace"
+assert_has "$BOX/state/calls" "$MQ_REBUILD"
+assert_lacks "$BOX/state/calls" "tc qdisc del"
 assert_has "$OUT" "qdiscs_on_default_1: fq mq"
+assert_lacks "$OUT" "could not rebuild mq"
+
+# A failure must show in the output; a silent one hid this bug on a real machine.
+new_qdisc_box qdisc-mq-rebuild-fails "$MQ_FQ_CODEL"
+touch "$BOX/state/tc-mq-fails"
+expect_ok network --role general --yes
+assert_has "$OUT" "warning: could not rebuild mq with fq on eth0"
+assert_has "$OUT" "qdiscs_on_default_1: fq_codel mq"
 
 new_qdisc_box qdisc-mq-ingress-kept "${MQ_FQ_CODEL}qdisc ingress ffff: parent ffff:fff1 ----------------\n"
 expect_ok network --role general --yes
-assert_has "$BOX/state/calls" "tc qdisc del dev eth0 root"
+assert_has "$BOX/state/calls" "$MQ_REBUILD"
 
 new_qdisc_box qdisc-mq-already-fq 'qdisc mq 0: root\nqdisc fq 8001: parent :2 limit 10000p\nqdisc fq 8002: parent :1 limit 10000p\n'
 expect_ok network --role general --yes
-assert_lacks "$BOX/state/calls" "tc qdisc del"
+assert_lacks "$BOX/state/calls" "tc qdisc"
+assert_has "$OUT" "qdiscs_on_default_1: fq mq"
+
+# Running again after a rebuild must leave the new mq alone.
+new_qdisc_box qdisc-mq-rebuilt 'qdisc mq 1: root\nqdisc fq 0: parent 1:2 limit 10000p\nqdisc fq 0: parent 1:1 limit 10000p\n'
+expect_ok network --role general --yes
+assert_lacks "$BOX/state/calls" "tc qdisc"
 assert_has "$OUT" "qdiscs_on_default_1: fq mq"
 
 new_qdisc_box qdisc-mq-custom-child 'qdisc mq 0: root\nqdisc htb 2: parent :2 r2q 10\nqdisc fq_codel 0: parent :1 limit 10240p\n'
 expect_ok network --role general --yes
-assert_lacks "$BOX/state/calls" "tc qdisc del"
+assert_lacks "$BOX/state/calls" "tc qdisc"
 assert_has "$OUT" "qdiscs_on_default_1: fq_codel htb mq"
 
-new_qdisc_box qdisc-mq-custom-handle 'qdisc mq 1: root\nqdisc fq_codel 0: parent 1:1 limit 10240p\n'
+new_qdisc_box qdisc-mq-custom-handle 'qdisc mq 2: root\nqdisc fq_codel 0: parent 2:1 limit 10240p\n'
 expect_ok network --role general --yes
-assert_lacks "$BOX/state/calls" "tc qdisc del"
+assert_lacks "$BOX/state/calls" "tc qdisc"
 
 new_qdisc_box qdisc-single-queue 'qdisc fq_codel 0: root refcnt 2 limit 10240p\n'
 expect_ok network --role general --yes
@@ -760,8 +781,7 @@ assert_has "$OUT" "qdiscs_on_default_1: fq"
 
 new_qdisc_box qdisc-htb-root 'qdisc htb 1: root refcnt 2 r2q 10\nqdisc fq_codel 0: parent 1:10 limit 10240p\n'
 expect_ok network --role general --yes
-assert_lacks "$BOX/state/calls" "tc qdisc del"
-assert_lacks "$BOX/state/calls" "tc qdisc replace"
+assert_lacks "$BOX/state/calls" "tc qdisc"
 
 # ---------------------------------------------------------- exit role reserved
 new_box exit-role-reserves-ssh-port

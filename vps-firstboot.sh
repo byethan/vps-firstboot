@@ -1502,10 +1502,11 @@ for iface in $VPS_FQ_IFACES; do
       tc qdisc replace dev "$iface" root fq >/dev/null 2>&1 || true
       ;;
     mq)
-      # The default mq has handle 0, so its children cannot be replaced one by
-      # one. Deleting it makes the kernel rebuild mq from default_qdisc.
+      # The kernel can neither delete the default mq (handle 0) nor address its
+      # children. A new mq takes its children from default_qdisc.
       if mq_children_need_fq "$qdiscs"; then
-        tc qdisc del dev "$iface" root >/dev/null 2>&1 || true
+        tc qdisc replace dev "$iface" root handle 1: mq >/dev/null 2>&1 ||
+          echo "warning: could not rebuild mq with fq on $iface" >&2
       fi
       ;;
     *) continue ;;
