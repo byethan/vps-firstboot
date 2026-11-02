@@ -1940,11 +1940,35 @@ apt_get() {
 apt_update() {
   local attempt
 
-  for attempt in 1 2 3; do
+  for attempt in 1 2 3 4 5 6; do
     apt_get update && return 0
-    log "apt-get update failed (attempt $attempt of 3)"
+    log "apt-get update failed (attempt $attempt of 6)"
     sleep 20
   done
+  return 1
+}
+
+# dpkg has no lock timeout of its own, and apt-daily can hold the lock at any time.
+dpkg_configure_pending() {
+  local attempt
+  local output
+
+  for (( attempt = 1; attempt <= 30; attempt++ )); do
+    if output="$(LC_ALL=C DEBIAN_FRONTEND=noninteractive dpkg --force-confdef --force-confold --configure -a 2>&1 </dev/null)"; then
+      if [[ -n "$output" ]]; then
+        printf '%s\n' "$output"
+      fi
+      return 0
+    fi
+    if [[ "$output" != *"locked by another process"* ]]; then
+      break
+    fi
+    if (( attempt == 1 )); then
+      log "waiting for another package manager to finish"
+    fi
+    sleep 10
+  done
+  printf '%s\n' "$output" >&2
   return 1
 }
 
@@ -2015,7 +2039,7 @@ AUTO_UPGRADES
 }
 
 apply_system_update() {
-  DEBIAN_FRONTEND=noninteractive dpkg --force-confdef --force-confold --configure -a </dev/null || return 1
+  dpkg_configure_pending || return 1
   apt_update || return 1
   ensure_debian_security_source || return 1
   apt_get -f install || return 1
@@ -2556,8 +2580,8 @@ show_verification_status() {
     fi
 
     if command -v fail2ban-client >/dev/null 2>&1; then
-      printf 'fail2ban_jail_sshd: %s\n' "$(fail2ban-client status sshd 2>/dev/null | awk -F': *' '/Status for the jail/ {print $2; found=1} END{if(!found) print "missing"}')"
-      printf 'fail2ban_banned: %s\n' "$(fail2ban-client status sshd 2>/dev/null | awk -F': *' '/Currently banned/ {print $2; found=1} END{if(!found) print "unknown"}')"
+      printf 'fail2ban_jail_sshd: %s\n' "$(fail2ban-client status sshd 2>/dev/null | awk -F':[[:space:]]*' '/Status for the jail/ {print $2; found=1} END{if(!found) print "missing"}')"
+      printf 'fail2ban_banned: %s\n' "$(fail2ban-client status sshd 2>/dev/null | awk -F':[[:space:]]*' '/Currently banned/ {print $2; found=1} END{if(!found) print "unknown"}')"
     else
       printf 'fail2ban_jail_sshd: %s\n' "not-installed"
       printf 'fail2ban_banned: %s\n' "unknown"
@@ -2601,7 +2625,7 @@ SSH_CONFIRM
   fi
 
   if [[ "$SYSTEM_UPDATE_RESULT" == "failed" ]]; then
-    printf '\nSystem update failed, so security updates are still missing. Fix apt and rerun.\n'
+    printf '\nSystem update failed, so security updates are still missing. Fix apt, then rerun:\n  vps-firstboot security --port %s --yes\n' "$SSH_PORT"
   fi
 
   third_party="$(third_party_kernels)"

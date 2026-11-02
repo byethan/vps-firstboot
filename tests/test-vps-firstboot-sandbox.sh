@@ -203,6 +203,14 @@ EOF
   write_stub apt-get <<EOF
 #!/bin/bash
 echo "apt-get frontend=\${DEBIAN_FRONTEND:-} \$*" >>"$BOX/state/calls"
+if [[ " \$* " == *" update "* && -e "$BOX/state/apt-update-locked-times" ]]; then
+  left="\$(cat "$BOX/state/apt-update-locked-times")"
+  if (( left > 0 )); then
+    echo \$(( left - 1 )) >"$BOX/state/apt-update-locked-times"
+    echo "E: Could not get lock /var/lib/apt/lists/lock" >&2
+    exit 100
+  fi
+fi
 if [[ -e "$BOX/state/apt-fails-on" ]] && [[ " \$* " == *" \$(cat "$BOX/state/apt-fails-on") "* ]]; then
   exit 100
 fi
@@ -222,6 +230,18 @@ if [[ "\$1" == "--print-architecture" ]]; then
   exit 0
 fi
 echo "dpkg \$*" >>"$BOX/state/calls"
+if [[ -e "$BOX/state/dpkg-broken" ]]; then
+  echo "dpkg: error processing package foo (--configure):" >&2
+  exit 1
+fi
+if [[ -e "$BOX/state/dpkg-locked-times" ]]; then
+  left="\$(cat "$BOX/state/dpkg-locked-times")"
+  if (( left > 0 )); then
+    echo \$(( left - 1 )) >"$BOX/state/dpkg-locked-times"
+    echo "dpkg: error: dpkg frontend lock was locked by another process with pid 6600" >&2
+    exit 2
+  fi
+fi
 EOF
   write_stub dpkg-query <<EOF
 #!/bin/bash
@@ -535,6 +555,40 @@ assert_has "$OUT" "System update failed"
 assert_listening "22 20022"
 assert_exists "$BOX/etc/sysctl.d/90-vps-bbr-fq.conf"
 assert_lacks "$BOX/state/calls" "install unattended-upgrades"
+
+# apt-daily can hold the dpkg lock at any moment, and dpkg itself never waits.
+new_box dpkg-lock-clears
+printf '3\n' >"$BOX/state/dpkg-locked-times"
+expect_ok "${SECURITY[@]}"
+assert_has "$OUT" "system_update: ok"
+assert_has "$OUT" "waiting for another package manager"
+assert_has "$BOX/state/calls" "full-upgrade"
+assert_exists "$BOX/etc/apt/apt.conf.d/20auto-upgrades"
+[[ "$(grep -c 'dpkg --force-confdef' "$BOX/state/calls")" == "4" ]] || fail "dpkg should run 4 times"
+ok
+
+new_box dpkg-lock-never-clears
+printf '1000\n' >"$BOX/state/dpkg-locked-times"
+expect_ok "${SECURITY[@]}"
+assert_has "$OUT" "system_update: failed"
+assert_has "$OUT" "locked by another process"
+assert_has "$OUT" "vps-firstboot security --port 20022 --yes"
+assert_lacks "$BOX/state/calls" "full-upgrade"
+[[ "$(grep -c 'dpkg --force-confdef' "$BOX/state/calls")" == "30" ]] || fail "dpkg should stop after 30 tries"
+ok
+
+new_box dpkg-fails-for-another-reason
+touch "$BOX/state/dpkg-broken"
+expect_ok "${SECURITY[@]}"
+assert_has "$OUT" "system_update: failed"
+assert_has "$OUT" "error processing package foo"
+[[ "$(grep -c 'dpkg --force-confdef' "$BOX/state/calls")" == "1" ]] || fail "dpkg should not retry a real failure"
+ok
+
+new_box apt-lists-lock-clears
+printf '4\n' >"$BOX/state/apt-update-locked-times"
+expect_ok "${SECURITY[@]}"
+assert_has "$OUT" "system_update: ok"
 
 new_box update-skipped
 expect_ok "${SECURITY[@]}" --no-system-update
