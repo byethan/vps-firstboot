@@ -37,7 +37,11 @@ args=(
 )
 
 url="https://raw.githubusercontent.com/byethan/vps-firstboot/$ver/vps-firstboot.sh"
-command -v curl >/dev/null || { apt-get update; apt-get install -y curl; } </dev/null
+# Install curl if missing. If another apt is running, wait up to 10 minutes.
+for i in 1 2 3 4 5; do
+  command -v curl >/dev/null && break
+  apt-get update; apt-get -o DPkg::Lock::Timeout=120 install -y curl || sleep 5
+done </dev/null
 curl -fsSL --retry 3 "$url" -o /root/vps-firstboot.sh &&
   printf '%s\n' "$key" | bash /root/vps-firstboot.sh all --public-key-stdin --yes "${args[@]}"
 ```
